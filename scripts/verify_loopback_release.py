@@ -165,10 +165,10 @@ _MIGRATION_TEST_MANIFEST = TestManifest(
     ),
 )
 _SECURITY_TEST_MANIFEST = TestManifest(
-    count=660,
+    count=730,
     digest=(
-        "sha256:7b45fe87f34aa26180c48a7bde37fb90"
-        "56d95b6854d988cbf7aea34fedbd91a8"
+        "sha256:222689264f4f9730a5de6fec2d76b40c"
+        "41073e0d01f82ea2b69379af139d8cf8"
     ),
 )
 _SAFETY_TEST_MANIFEST = TestManifest(
@@ -186,10 +186,10 @@ _FRONTEND_TEST_MANIFEST = TestManifest(
     ),
 )
 _FULL_TEST_MANIFEST = TestManifest(
-    count=5161,
+    count=5232,
     digest=(
-        "sha256:e9d5ed65522fb1008195c6ec24fcd4566"
-        "406dbc4329f727c55108b0e72a091bd"
+        "sha256:dd7addadfc403ec0d9e91e4a44e49400"
+        "e21f58c5c365a8b90632ab2cbbd9c524"
     ),
 )
 
@@ -1762,6 +1762,9 @@ class ReleaseVerifier:
                     "tests/test_untrusted_content.py",
                     "tests/test_candidate_boundary.py",
                     "tests/test_security_posture.py",
+                    "tests/test_release_evidence.py",
+                    "tests/test_release_actions_client.py",
+                    "tests/test_release_operator_boundary.py",
                     "-v",
                 ),
                 timeout_seconds=1200.0,

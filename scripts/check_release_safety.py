@@ -4398,6 +4398,33 @@ def _yaml_key_line(path: Path, key: str) -> int:
     return 1
 
 
+def _scan_operator_release_imports(root: Path) -> list[ReleaseViolation]:
+    """An authenticated operator script must not enter the trading runtime."""
+    findings = []
+    for path in _python_sources(root):
+        relative = path.relative_to(root).as_posix()
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):
+            findings.append(_finding("OPERATOR_TOOL_RUNTIME_IMPORT", relative, 1))
+            continue
+        for node in ast.walk(tree):
+            modules = []
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                modules = [node.module or ""]
+            elif isinstance(node, ast.Call) and _attribute_path(node.func)[-1:] in (
+                ("import_module",), ("__import__",), ("run_module",), ("run_path",),
+                ("spec_from_file_location",), ("SourceFileLoader",),
+            ):
+                modules = [arg.value for arg in node.args if isinstance(arg, ast.Constant) and isinstance(arg.value, str)]
+            if any(value == "scripts" or value.startswith("scripts.")
+                   or "sync_release_evidence" in value for value in modules):
+                findings.append(_finding("OPERATOR_TOOL_RUNTIME_IMPORT", relative, node.lineno))
+    return findings
+
+
 def _python_sources(root: Path) -> list[Path]:
     source_root = root / "src" / "trading_assistant"
     if not source_root.exists():
@@ -9035,6 +9062,11 @@ _STRUCTURED_RELEASE_SCANNERS = (
         _scan_outbound_clients,
         "OUTBOUND_CLIENT_UNAPPROVED",
         "src/trading_assistant/security/outbound.py",
+    ),
+    (
+        _scan_operator_release_imports,
+        "OPERATOR_TOOL_RUNTIME_IMPORT",
+        "scripts/sync_release_evidence.py",
     ),
     (
         _scan_transport_and_integrations,

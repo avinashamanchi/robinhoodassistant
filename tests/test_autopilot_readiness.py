@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 import pytest
+from tests.release_report_fixture import install_contract, report_fixture
 from sqlalchemy import update
 
 from trading_assistant.autopilot.evidence import (
@@ -78,7 +79,10 @@ def _root(tmp_path, *, commit=COMMIT, passed=True, mode=0o600):
     (root / ".git" / "HEAD").write_text(f"{commit}\n", encoding="utf-8")
     evidence = root / ".local/verification/release-results.json"
     evidence.parent.mkdir(parents=True)
-    evidence.write_text(json.dumps({"passed": passed, "commit": COMMIT}), encoding="utf-8")
+    install_contract(root)
+    payload = report_fixture(COMMIT)
+    payload["passed"] = passed
+    evidence.write_text(json.dumps(payload), encoding="utf-8")
     evidence.chmod(mode)
     return root
 
@@ -305,6 +309,12 @@ def test_release_verification_must_pass_for_the_running_commit(baseline, tmp_pat
 
 def test_missing_release_evidence_fails(baseline):
     (baseline.root / ".local/verification/release-results.json").unlink()
+    assert "release_verification" in _unmet(_evaluate(baseline))
+
+
+def test_a_bare_pass_flag_is_not_complete_release_evidence(baseline):
+    path = baseline.root / ".local/verification/release-results.json"
+    path.write_text(json.dumps({"passed": True, "commit": COMMIT}))
     assert "release_verification" in _unmet(_evaluate(baseline))
 
 

@@ -149,8 +149,50 @@ downloads real bars with the operator's Alpaca credentials and needs the
 `paper-drill` role, so stop the app and daemon first.
 
 The verifier refuses to run in a checkout that has a root `.env`. Run it in a
-clean clone of the same commit and point `release_evidence_path` at that
-clone's `.local/verification/release-results.json`.
+clean clone of the same commit, then publish its canonical report using the
+operator utility below. Keep the runtime's evidence path at its default,
+`.local/verification/release-results.json`.
+
+### Publishing verification to the runtime
+
+The gate accepts the complete canonical verifier report, including its eight
+successful stages, pinned test totals, migration head and verified isolation
+claims. A `passed` flag by itself is insufficient. CI checks out the exact PR
+head (or push commit), and uploads its report only after the dependency audit
+and isolated migration/safety drill succeed.
+
+From the clean designated runtime checkout, import that immutable artifact:
+
+```bash
+.venv/bin/python scripts/sync_release_evidence.py sync \
+  --repository avinashamanchi/robinhoodassistant
+```
+
+The standalone operator script uses the already authenticated Composio CLI for
+read-only GitHub metadata and artifact download. It is not imported by the app
+or daemon, and does not read trading credentials. The trading runtime's Composio
+integration remains disabled. No former project Composio credential is used.
+The script requires successful verification and secret-scan jobs for the exact
+repository, commit, workflow and run attempt, then verifies the downloaded ZIP's
+GitHub digest and its single bounded report. Publication uses a private atomic
+replacement with an immutable hash-bound provenance receipt. Failed imports
+leave the previous report intact; it cannot authorize another commit.
+
+Use `--run-id NUMBER` to select a particular successful CI run. The default
+selects the newest CI run for the current commit. A pending or failed newest run
+is reported as blocked rather than silently using an older run.
+
+For a local verification performed in a clean same-commit clone:
+
+```bash
+.venv/bin/python scripts/sync_release_evidence.py publish-local \
+  --report /absolute/private/clone/.local/verification/release-results.json
+```
+
+Both paths require a clean tracked source tree, tolerate ignored runtime data,
+and recheck HEAD immediately before publication. Neither changes strategy,
+approval, risk limits, breaker state or trading records. The daemon refreshes
+readiness on its next tick; all other readiness requirements still apply.
 
 ## Installation designation
 

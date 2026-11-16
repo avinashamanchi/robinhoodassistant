@@ -30,6 +30,7 @@ from typing import Any, Callable, Optional
 
 from ..assets import AssetClass
 from ..config import AppConfig, TradingMode
+from ..ops.release_evidence import EvidenceError, read_report, validate_report
 from .decisions import autopilot_config_problems, resolve_universe
 from .evidence import CLEAN_RESULTS, EvidenceRecord, EvidenceStore
 from .identity import (
@@ -97,22 +98,9 @@ def _release_requirement(config: AppConfig, root: Path, commit: Optional[str]) -
     path = Path(readiness.release_evidence_path)
     path = path if path.is_absolute() else root / path
     try:
-        info = os.lstat(path)
-        if not (info.st_mode & 0o170000 == 0o100000) or info.st_mode & 0o077:
-            return Requirement("release_verification", False, f"{path} is not a private regular file")
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return Requirement("release_verification", False, f"no release evidence at {path}")
-    except (OSError, ValueError):
-        return Requirement("release_verification", False, f"unreadable release evidence at {path}")
-    if payload.get("passed") is not True:
-        return Requirement("release_verification", False, "latest release verification did not pass")
-    if payload.get("commit") != commit:
-        return Requirement(
-            "release_verification",
-            False,
-            f"release evidence is for {payload.get('commit')}, running {commit}",
-        )
+        validate_report(read_report(path), expected_commit=commit, root=root)
+    except (OSError, EvidenceError) as error:
+        return Requirement("release_verification", False, str(error))
     return Requirement("release_verification", True, f"verified commit {commit}")
 
 

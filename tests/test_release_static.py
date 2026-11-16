@@ -4703,6 +4703,7 @@ def test_ci_actions_are_commit_pinned_and_checkout_complete_history():
     assert isinstance(jobs, dict)
     expected_action_commits = {
         "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "actions/upload-artifact": "cf430e030ddbb5b0abf93d22962f4752f3646cd9",
         "astral-sh/setup-uv": "08807647e7069bb48b6ef5acd8ec9567f424441b",
         "gitleaks/gitleaks-action": (
             "ff98106e4c7b2bc287b24eaf42907196329070c7"
@@ -4739,6 +4740,7 @@ def test_ci_actions_are_commit_pinned_and_checkout_complete_history():
         assert isinstance(with_values, dict)
         assert with_values.get("fetch-depth") == "0"
         assert with_values.get("persist-credentials") == "false"
+        assert with_values.get("ref") == "${{ github.event.pull_request.head.sha || github.sha }}"
 
     setup_uv_steps = [
         step
