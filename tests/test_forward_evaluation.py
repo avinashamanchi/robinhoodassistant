@@ -168,3 +168,34 @@ def test_legacy_equity_statistics_discloses_unverified_quote_and_independent_dra
     stats = equity_statistics(rows)
     assert stats['max_equity_drawdown_pct'] == '50.000'
     assert stats['benchmark_verified'] is False
+
+
+def test_fill_quality_excludes_untrusted_fills_and_reports_coverage(make_service):
+    from datetime import datetime, timezone
+    from tests.test_equity_and_fill_quality import _service
+    from trading_assistant.db.models import Fill, Order
+    from trading_assistant.ops.paper_report import fill_quality
+    service, broker = _service(make_service)
+    proposal = service.propose_order('AAPL', 'buy', 'market', qty='2', idempotency_key='optest-filter',
+                                     actor='operator:demo', reason='fixture', request_id='p-filter')
+    service.approve_order(proposal['order_id'], actor='operator:demo', reason='ok', request_id='a-filter')
+    with service.session_factory() as session:
+        order = session.get(Order, proposal['order_id'])
+        broker.fill(order.broker_order_id, Decimal('1'), Decimal('100.20'))
+    service.reconciliation.reconcile(actor='operator:demo', reason='fixture', request_id='r-filter')
+    with service.session_factory() as session:
+        session.add(Fill(order_id=proposal['order_id'], ticker='AAPL', side='buy', qty=Decimal('1'),
+                         price=Decimal('200'), reconciliation_state='quarantined',
+                         filled_at=datetime.now(timezone.utc)))
+        session.commit()
+    quality = fill_quality(service.session_factory)
+    assert quality['trusted_fills'] == 1
+    assert quality['excluded_untrusted_fills'] == 1
+    assert quality['orders'][0]['average_fill'] == '100.2000'
+    assert quality['orders'][0]['slippage_bps'] == '20.0'
+    assert quality['trusted_fills_with_decision_quote'] == 1
+    from trading_assistant.ops.paper_report import build_report, render_text
+    with service.session_factory() as session:
+        report = build_report(session)
+    report['fill_quality'] = quality
+    assert 'fill-quality coverage: 1 trusted, 1 excluded untrusted, 1 with decision quote' in render_text(report)

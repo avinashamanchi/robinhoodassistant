@@ -367,6 +367,7 @@ def fill_quality(session_factory, *, since=None, until=None) -> dict[str, object
     from ..security.sensitive_fields import sensitive_store
 
     rows = []
+    trusted_fills = excluded_untrusted = matched_fills = 0
     with session_factory() as session:
         store = sensitive_store(session, session_factory)
         quotes: dict[str, dict] = {}
@@ -377,16 +378,24 @@ def fill_quality(session_factory, *, since=None, until=None) -> dict[str, object
                 continue
             if isinstance(detail, dict) and isinstance(detail.get("decision_quote"), dict):
                 quotes[event.target_id] = detail["decision_quote"]
+        query = select(Fill)
+        if since is not None:
+            query = query.where(Fill.filled_at >= since)
+        if until is not None:
+            query = query.where(Fill.filled_at < until)
+        fills_by_order = defaultdict(list)
+        for fill in session.scalars(query):
+            if not fill_has_trusted_identity(fill):
+                excluded_untrusted += 1
+                continue
+            trusted_fills += 1
+            fills_by_order[fill.order_id].append(fill)
         for order in session.scalars(select(Order)):
-            query = select(Fill).where(Fill.order_id == order.id)
-            if since is not None:
-                query = query.where(Fill.filled_at >= since)
-            if until is not None:
-                query = query.where(Fill.filled_at < until)
-            fills = list(session.scalars(query))
+            fills = fills_by_order.get(order.id, [])
             quote = quotes.get(str(order.id))
             if not fills or quote is None:
                 continue
+            matched_fills += len(fills)
             qty = sum((Decimal(f.qty) for f in fills), _ZERO)
             average = sum((Decimal(f.qty) * Decimal(f.price) for f in fills), _ZERO) / qty
             mid = (Decimal(quote["bid"]) + Decimal(quote["ask"])) / 2
@@ -413,6 +422,10 @@ def fill_quality(session_factory, *, since=None, until=None) -> dict[str, object
             )
     return {
         "orders": rows,
+        "trusted_fills": trusted_fills,
+        "excluded_untrusted_fills": excluded_untrusted,
+        "trusted_fills_with_decision_quote": matched_fills,
+        "trusted_fills_without_decision_quote_or_order": trusted_fills - matched_fills,
         "note": "decision quote = the quote the proposal's risk check used; orders proposed before "
         "this was recorded have no decision quote and are omitted",
     }
@@ -493,7 +506,10 @@ def render_text(report: dict[str, object]) -> str:
         lines += ["", "Account equity (daemon snapshots)", f"  {equity}"]
     quality = report.get("fill_quality")
     if quality is not None:
-        lines += ["", "Fill quality (fill vs decision-time mid; positive bps = worse)"]
+        lines += ["", "Fill quality (fill vs decision-time mid; positive bps = worse)",
+                  f"  fill-quality coverage: {quality['trusted_fills']} trusted, "
+                  f"{quality['excluded_untrusted_fills']} excluded untrusted, "
+                  f"{quality['trusted_fills_with_decision_quote']} with decision quote"]
         lines += [f"  {row}" for row in quality["orders"]] or ["  no filled orders with a decision quote"]
     autopilot = report.get("autopilot")
     if autopilot is not None:
