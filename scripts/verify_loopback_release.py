@@ -165,10 +165,10 @@ _MIGRATION_TEST_MANIFEST = TestManifest(
     ),
 )
 _SECURITY_TEST_MANIFEST = TestManifest(
-    count=791,
+    count=811,
     digest=(
-        "sha256:0ccf925078205d064b02d8cae3264ee2"
-        "58c97ee6ce345bb5bba98374506d542d"
+        "sha256:f0956c38d22c829057bf2af8cf1625f2"
+        "4435e7f95287f4384443a09e078be844"
     ),
 )
 _SAFETY_TEST_MANIFEST = TestManifest(
@@ -186,10 +186,10 @@ _FRONTEND_TEST_MANIFEST = TestManifest(
     ),
 )
 _FULL_TEST_MANIFEST = TestManifest(
-    count=5271,
+    count=5291,
     digest=(
-        "sha256:9d3c5551a9307f3a4e780a1e39133615"
-        "e5b741c67d6f824bd1afe43489ec3329"
+        "sha256:ff8fc47b47eb73dd313bf33287d5ac5a"
+        "d088f517833f5ad1c4986e1961091e69"
     ),
 )
 
@@ -1770,6 +1770,7 @@ class ReleaseVerifier:
                     "tests/test_runtime_operations.py",
                     "tests/test_runtime_alerts.py",
                     "tests/test_launchd_installer.py",
+                    "tests/test_forward_evaluation.py",
                     "-v",
                 ),
                 timeout_seconds=1200.0,
