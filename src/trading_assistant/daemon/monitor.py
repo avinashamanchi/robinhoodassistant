@@ -54,6 +54,7 @@ class Monitor:
         autopilot=None,
         autopilot_timeout_seconds: float = 120.0,
         equity_recorder=None,
+        campaign_capture=None,
     ) -> None:
         self.service = service
         # ops.equity.EquitySnapshotRecorder or None: periodic, best-effort,
@@ -61,6 +62,8 @@ class Monitor:
         self.equity_recorder = equity_recorder
         self.equity_timeout = 20.0
         self._equity_task: Optional[asyncio.Task[Any]] = None
+        self.campaign_capture = campaign_capture
+        self._campaign_task: Optional[asyncio.Task[Any]] = None
         # Daemon-hosted autopilot (autopilot.runner.AutopilotRunner) or None.
         self.autopilot = autopilot
         self.autopilot_timeout = autopilot_timeout_seconds
@@ -311,6 +314,24 @@ class Monitor:
             return
         self._equity_task = asyncio.create_task(self._bounded_equity_snapshot())
 
+    async def _campaign_worker(self) -> None:
+        task = asyncio.create_task(asyncio.to_thread(self.campaign_capture.capture))
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=30.0)
+        except TimeoutError:
+            log.warning("campaign_capture_timed_out")
+            try:
+                await task
+            except Exception:
+                log.warning("campaign_capture_failed")
+        except Exception:
+            log.warning("campaign_capture_failed")
+
+    def _schedule_campaign_capture(self) -> None:
+        if self.campaign_capture is None or (self._campaign_task is not None and not self._campaign_task.done()):
+            return
+        self._campaign_task = asyncio.create_task(self._campaign_worker())
+
     def _schedule_autopilot(self) -> None:
         if self.autopilot is None:
             return
@@ -362,6 +383,7 @@ class Monitor:
                     await self._bounded_core_cycle()
                     self.service.write_heartbeat("daemon")
                     self._schedule_equity_snapshot()
+                    self._schedule_campaign_capture()
                     # Daily analysis is isolated from safety heartbeats.
                     self._schedule_daily_tasks()
                     self._schedule_autopilot()

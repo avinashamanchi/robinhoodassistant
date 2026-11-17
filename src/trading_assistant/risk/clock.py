@@ -8,7 +8,7 @@ We never hand-roll a holiday calendar. Consumers depend only on the
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Protocol, runtime_checkable
 
 
@@ -22,6 +22,7 @@ class MarketClockObservation:
 
 @runtime_checkable
 class MarketClock(Protocol):
+    def session_range(self, start: date, end: date) -> dict: ...
     def observe(self, at: datetime) -> MarketClockObservation: ...
     def is_open(self, at: datetime | None = None) -> bool: ...
     def next_open(self, at: datetime | None = None) -> datetime: ...
@@ -31,6 +32,9 @@ class MarketClock(Protocol):
 
 class CryptoClock:
     """Crypto trades 24/7 — always open. Satisfies the MarketClock protocol (Phase 7)."""
+
+    def session_range(self, start: date, end: date) -> dict:
+        raise ValueError("equity calendar unavailable from crypto clock")
 
     def observe(self, at: datetime) -> MarketClockObservation:
         return MarketClockObservation(
@@ -62,11 +66,19 @@ class FakeClock:
         next_open: datetime | None = None,
         next_close: datetime | None = None,
         most_recent_open: datetime | None = None,
+        schedule: list[dict] | None = None,
     ) -> None:
         self._open = is_open
         self._next_open = next_open or datetime(2026, 1, 1, tzinfo=timezone.utc)
         self._next_close = next_close or datetime(2026, 1, 1, tzinfo=timezone.utc)
         self._most_recent_open = most_recent_open
+        self._schedule = schedule
+
+    def session_range(self, start: date, end: date) -> dict:
+        if self._schedule is None or type(start) is not date or type(end) is not date or start > end or (end - start).days > 31:
+            raise ValueError("explicit bounded mock schedule required")
+        return {"start": start.isoformat(), "end": end.isoformat(), "source": "mock_calendar",
+                "sessions": [dict(row) for row in self._schedule if start.isoformat() <= row["date"] <= end.isoformat()]}
 
     def set_open(self, value: bool) -> None:
         self._open = value

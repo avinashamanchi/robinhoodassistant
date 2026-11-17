@@ -14,6 +14,43 @@ def module():
 NOW = datetime(2026, 11, 17, tzinfo=timezone.utc)
 
 
+def test_stale_and_duplicate_health_observations_never_clear_new_failure(tmp_path):
+    m = module()
+    from trading_assistant.ops.operational_state import StateStore
+    store = StateStore(tmp_path)
+    newer = NOW + timedelta(seconds=30)
+    failure = [{"component": "daemon", "status": "fail", "code": "heartbeat_stale"}]
+    passing = [{"component": "daemon", "status": "pass", "code": "heartbeat_fresh"}]
+    first = m.record_checks(store, failure, newer)
+    for at in (NOW, newer):
+        result = m.record_checks(store, passing, at)
+        assert result["checked_at"] == newer.isoformat()
+        assert result["incidents"]["daemon"] == first["incidents"]["daemon"]
+    assert store.load("health")["stale_observations"] == 2
+
+
+def test_doctor_single_owner_rejects_overlapping_capture(tmp_path):
+    import pytest
+    m = module()
+    from trading_assistant.ops.operational_state import StateError, StateStore
+    store = StateStore(tmp_path)
+    with store.lease("doctor-owner"):
+        with pytest.raises(StateError):
+            m.doctor(tmp_path, store, NOW)
+    assert store.load("health") == {}
+
+
+def test_stale_doctor_does_not_clear_newer_maintenance_state(tmp_path):
+    m = module()
+    from trading_assistant.ops.operational_state import StateStore
+    store = StateStore(tmp_path)
+    store.update("maintenance", lambda _: {"active_since": NOW.isoformat()})
+    m.record_checks(store, [{"component": "daemon", "status": "fail", "code": "heartbeat_stale"}], NOW + timedelta(seconds=30))
+    m.doctor(tmp_path, store, NOW)
+    assert store.load("maintenance")["active_since"] == NOW.isoformat()
+    assert store.load("health")["incidents"]["daemon"]["state"] == "open"
+
+
 def test_incidents_persist_deduplicate_and_unknown_does_not_resolve(tmp_path):
     m = module()
     from trading_assistant.ops.operational_state import StateStore

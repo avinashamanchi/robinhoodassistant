@@ -913,6 +913,17 @@ class AlpacaClock:
     def next_close(self, at=None):
         return _retry(self._trading.get_clock).next_close
 
+    def session_range(self, start: date, end: date):
+        if type(start) is not date or type(end) is not date or start > end or (end - start).days > 31:
+            raise ValueError("invalid calendar range")
+        raw = _retry(self._trading.get_calendar, GetCalendarRequest(start=start, end=end), attempts=1)
+        rows = self._validated_sessions(raw, exchange_timezone=ZoneInfo("America/New_York"), start_date=start, end_date=end)
+        if not rows and (end - start).days >= 7:
+            raise BrokerDataIntegrityError("empty Alpaca market calendar")
+        return {"start": start.isoformat(), "end": end.isoformat(), "source": "alpaca_calendar", "sessions": [
+            {"date": day.isoformat(), "open": opened.isoformat(), "close": closed.isoformat()}
+            for day, opened, closed in sorted(rows)]}
+
     def observe(self, at: datetime) -> MarketClockObservation:
         observed_at = self._observation_time(at)
         exchange_timezone = ZoneInfo("America/New_York")

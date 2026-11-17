@@ -204,7 +204,42 @@ def _finish_monitor(
         autopilot=autopilot,
         autopilot_timeout_seconds=config.autopilot.cycle_timeout_seconds,
         equity_recorder=EquitySnapshotRecorder(service),
+        campaign_capture=_build_campaign_capture(config, service, runtime_tenure_guard),
     )
+
+
+def _build_campaign_capture(config, service, guard, root=None, *, config_fingerprint=None, code_fingerprint=None):
+    from ..assets import AssetClass
+    from ..autopilot.evidence import EvidenceStore
+    from ..autopilot.identity import config_fingerprint as config_identity, decision_code_fingerprint, code_identity
+    from ..installation import source_root
+    from ..ops.acceptance_campaign import CampaignCapture, read_reconciliation, read_daemon_order_reconciliation, read_position_reconciliation
+    from ..ops.operational_state import StateStore
+    config_fingerprint = config_fingerprint or config_identity
+    code_fingerprint = code_fingerprint or decision_code_fingerprint
+    scope = {"mode": config.autopilot.mode, "config_fingerprint": config_fingerprint(config),
+             "code_fingerprint": code_fingerprint(config.autopilot.strategy)}
+    def order_reconciliation(at):
+        if config.trading.broker.value != "alpaca":
+            return "unknown", "0" * 64
+        return read_daemon_order_reconciliation(service.session_factory, at, config.trading.reconciliation_max_age_seconds)
+
+    def startup_reconciliation(at):
+        if config.trading.broker.value != "alpaca":
+            return "unknown", "0" * 64
+        return read_reconciliation(service.session_factory, "alpaca", at, config.trading.reconciliation_max_age_seconds)
+
+    def position_reconciliation(at):
+        if config.trading.broker.value != "alpaca":
+            return "unknown", "0" * 64
+        return read_position_reconciliation(service.session_factory, at, config.trading.reconciliation_max_age_seconds)
+
+    return CampaignCapture(StateStore(root or source_root()), service.market_clock(AssetClass.EQUITY),
+                           EvidenceStore(service.session_factory, actor="campaign"), scope, guard,
+                           delay_minutes=getattr(config.autopilot, "run_after_open_minutes", 30),
+                           reconciliation_reader=startup_reconciliation,
+                           order_reconciliation_reader=order_reconciliation, position_reconciliation_reader=position_reconciliation,
+                           runtime_code=code_identity(root or source_root()))
 
 
 def _build_autopilot_runner(

@@ -44,9 +44,11 @@ def record_checks(store, checks, now):
                 or set(check) != {"component", "code", "status"}):
             raise ValueError("unknown health check")
     def change(previous):
+        last = previous.get("checked_at")
+        if last is not None and now <= _date(last):
+            return {**previous, "stale_observations": min(previous.get("stale_observations", 0) + 1, 1000000000)}
         incidents = previous.get("incidents", {})
         events = previous.get("events", [])
-        last = previous.get("checked_at")
         gap = last is not None and not 0 <= (now - _date(last)).total_seconds() <= 180
         effective = checks + [{"component":"monitor", "status":"fail" if gap else "pass",
                                "code":"monitoring_gap" if gap else "monitoring_current"}]
@@ -67,6 +69,7 @@ def record_checks(store, checks, now):
                 events.append({"id":uuid.uuid4().hex, "incident_id":old["id"],
                                "component":component, "code":check["code"], "state":"resolved", "at":at})
         return {"schema_version":1, "checked_at":at, "checks":effective, "incidents":incidents,
+                "stale_observations":previous.get("stale_observations", 0),
                 "events":events[-100:], "discarded_events":previous.get("discarded_events",0)+max(0,len(events)-100)}
     return store.update("health", change)
 
@@ -193,6 +196,14 @@ def power_run(store, stop=None):
 
 
 def doctor(root, store, now):
+    with store.lease("doctor-owner"):
+        previous = store.load("health")
+        if previous.get("checked_at") and now <= _date(previous["checked_at"]):
+            return record_checks(store, [], now)
+        return _doctor(root, store, now)
+
+
+def _doctor(root, store, now):
     maintenance = maintenance_state(root)
     if maintenance == "active":
         observed = store.update("maintenance",lambda old: old if old.get("active_since") else {"active_since":stamp(now)})
