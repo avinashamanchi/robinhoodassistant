@@ -274,6 +274,7 @@ def build_report(
         for fill in session.scalars(fill_query)
     ]
     trusted = [fill for fill in fills if fill.trusted]
+    window_fills = [fill for fill in fills if since is None or _aware(fill.filled_at) >= _aware(since)]
     pnl = fifo_pnl(trusted, since=since)
     by_source = {
         source: _pnl_summary(fifo_pnl([f for f in trusted if f.source == source], since=since))
@@ -309,8 +310,8 @@ def build_report(
         },
         "funnel": _funnel(orders),
         "fills": {
-            "trusted": len(trusted),
-            "excluded_untrusted": len(fills) - len(trusted),
+            "trusted": sum(fill.trusted for fill in window_fills),
+            "excluded_untrusted": sum(not fill.trusted for fill in window_fills),
         },
         "pnl": {
             "realized": _decimal(realized),
@@ -355,7 +356,7 @@ def build_report(
     }
 
 
-def fill_quality(session_factory) -> dict[str, object]:
+def fill_quality(session_factory, *, since=None, until=None) -> dict[str, object]:
     """Fill price against the quote the proposal was judged on (needs field keys).
 
     Slippage in basis points is (average fill - decision mid) / mid, signed so
@@ -377,7 +378,12 @@ def fill_quality(session_factory) -> dict[str, object]:
             if isinstance(detail, dict) and isinstance(detail.get("decision_quote"), dict):
                 quotes[event.target_id] = detail["decision_quote"]
         for order in session.scalars(select(Order)):
-            fills = list(session.scalars(select(Fill).where(Fill.order_id == order.id)))
+            query = select(Fill).where(Fill.order_id == order.id)
+            if since is not None:
+                query = query.where(Fill.filled_at >= since)
+            if until is not None:
+                query = query.where(Fill.filled_at < until)
+            fills = list(session.scalars(query))
             quote = quotes.get(str(order.id))
             if not fills or quote is None:
                 continue
@@ -529,6 +535,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="also decrypt autopilot evidence, equity snapshots and decision quotes (field keys)",
     )
+    parser.add_argument("--benchmark", default="SPY", help="explicit buy-and-hold benchmark symbol")
     parser.add_argument("--json", type=Path)
     parser.add_argument(
         "--database",
@@ -569,12 +576,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.with_encrypted:
         from ..autopilot.evidence import EvidenceStore
 
-        from .equity import equity_statistics, read_snapshots
+        from .equity import read_snapshots_with_coverage
+        from .forward_evaluation import evaluate
 
         store = EvidenceStore(factory, actor="paper-report")
-        report["autopilot"] = autopilot_summary(store.cycles())
-        report["equity"] = equity_statistics(read_snapshots(factory))
-        report["fill_quality"] = fill_quality(factory)
+        cycles = store.cycles()
+        if args.since or args.until:
+            cycles = [cycle for cycle in cycles if cycle.detail.get("session") and
+                      (args.since is None or cycle.detail["session"] >= args.since.date().isoformat()) and
+                      (args.until is None or cycle.detail["session"] < args.until.date().isoformat())]
+        report["autopilot"] = autopilot_summary(cycles)
+        snapshots, unreadable = read_snapshots_with_coverage(factory)
+        report["equity"] = evaluate(snapshots, benchmark=args.benchmark.upper(), since=args.since, until=args.until, unreadable_rows=unreadable)
+        report["fill_quality"] = fill_quality(factory, since=args.since, until=args.until)
     print(render_text(report))
     if args.json is not None:
         try:

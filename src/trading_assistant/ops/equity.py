@@ -83,14 +83,33 @@ class EquitySnapshotRecorder:
         positions = broker.get_positions()
         values = [p.qty * p.current_price for p in positions]
         benchmark_last: Optional[str] = None
+        benchmark_at: Optional[str] = None
         try:
             quote = broker.get_quote(self.benchmark)
             if quote.is_valid:
                 benchmark_last = str(quote.last)
+                if quote.trade_as_of is not None:
+                    benchmark_at = quote.trade_as_of.isoformat()
         except Exception:
             benchmark_last = None
+        coverage, activities = "baseline", []
+        if self._last is not None:
+            coverage = "unknown"
+            try:
+                reader = getattr(broker, "get_economic_activities", None)
+                if callable(reader):
+                    result = reader(self._last, observed_at)
+                    coverage = result["coverage"]
+                    activities = result["activities"]
+            except Exception:
+                coverage, activities = "incomplete", []
         return {
-            "schema": 1,
+            "schema": 2,
+            "currency": getattr(account, "currency", None),
+            "activity_coverage": coverage,
+            "activity_interval_start": self._last.isoformat() if self._last else None,
+            "activities": activities,
+            "benchmark_at": benchmark_at,
             "observed_at": observed_at.isoformat(),
             "source": "alpaca_paper" if self.service.config.trading.broker.value == "alpaca" else "mock",
             "equity": str(account.equity),
@@ -106,7 +125,13 @@ class EquitySnapshotRecorder:
 
 def read_snapshots(session_factory) -> list[dict[str, Any]]:
     """Decrypted snapshots in time order (unreadable rows are skipped and counted)."""
+    return read_snapshots_with_coverage(session_factory)[0]
+
+
+def read_snapshots_with_coverage(session_factory) -> tuple[list[dict[str, Any]], int]:
+    """Return decrypted rows and the count that could not be read or parsed."""
     out: list[dict[str, Any]] = []
+    unreadable = 0
     with session_factory() as session:
         store = sensitive_store(session, session_factory)
         query = (
@@ -118,10 +143,13 @@ def read_snapshots(session_factory) -> list[dict[str, Any]]:
             try:
                 detail = json.loads(store.read(event, "detail_json"))
             except Exception:
+                unreadable += 1
                 continue
             if isinstance(detail, dict) and "equity" in detail:
                 out.append(detail)
-    return out
+            else:
+                unreadable += 1
+    return out, unreadable
 
 
 def equity_statistics(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
@@ -141,9 +169,8 @@ def equity_statistics(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
     for _at, equity, _bench in points:
         peak = max(peak, equity)
         drop = peak - equity
-        if drop > worst:
-            worst = drop
-            worst_pct = (drop / peak * 100) if peak else Decimal(0)
+        worst = max(worst, drop)
+        worst_pct = max(worst_pct, (drop / peak * 100) if peak else Decimal(0))
     first, last = points[0], points[-1]
     equity_return = (last[1] / first[1] - 1) * 100 if first[1] else None
     benchmark_return = None
@@ -160,5 +187,7 @@ def equity_statistics(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
         "max_equity_drawdown": f"{worst:.2f}",
         "max_equity_drawdown_pct": f"{worst_pct:.3f}",
         "benchmark": snapshots[0].get("benchmark"),
+        "benchmark_verified": False,
+        "benchmark_note": "legacy endpoint comparison does not validate quote timestamps or matched marks",
         "benchmark_return_pct": None if benchmark_return is None else f"{benchmark_return:.3f}",
     }

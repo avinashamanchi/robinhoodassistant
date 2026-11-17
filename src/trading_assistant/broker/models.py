@@ -299,6 +299,7 @@ class Account:
     buying_power: Decimal
     equity: Decimal
     cash: Decimal
+    currency: Optional[str] = None
 
     @property
     def is_valid(self) -> bool:
