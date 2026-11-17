@@ -602,8 +602,9 @@ def main(argv: list[str] | None = None) -> int:
                       (args.since is None or cycle.detail["session"] >= args.since.date().isoformat()) and
                       (args.until is None or cycle.detail["session"] < args.until.date().isoformat())]
         report["autopilot"] = autopilot_summary(cycles)
-        snapshots, unreadable = read_snapshots_with_coverage(factory)
+        snapshots, unreadable = read_snapshots_with_coverage(factory, since=args.since, until=args.until)
         report["equity"] = evaluate(snapshots, benchmark=args.benchmark.upper(), since=args.since, until=args.until, unreadable_rows=unreadable)
+        report["equity"]["unreadable_rows_time_basis"] = "audit creation time (observation timestamp unavailable)"
         report["fill_quality"] = fill_quality(factory, since=args.since, until=args.until)
     print(render_text(report))
     if args.json is not None:

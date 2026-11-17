@@ -128,8 +128,11 @@ def read_snapshots(session_factory) -> list[dict[str, Any]]:
     return read_snapshots_with_coverage(session_factory)[0]
 
 
-def read_snapshots_with_coverage(session_factory) -> tuple[list[dict[str, Any]], int]:
-    """Return decrypted rows and the count that could not be read or parsed."""
+def read_snapshots_with_coverage(session_factory, *, since=None, until=None) -> tuple[list[dict[str, Any]], int]:
+    """Return snapshots and unreadable count scoped by audit creation time.
+
+    Creation time is only a proxy when the observation itself cannot be read.
+    """
     out: list[dict[str, Any]] = []
     unreadable = 0
     with session_factory() as session:
@@ -143,12 +146,15 @@ def read_snapshots_with_coverage(session_factory) -> tuple[list[dict[str, Any]],
             try:
                 detail = json.loads(store.read(event, "detail_json"))
             except Exception:
-                unreadable += 1
-                continue
+                detail = None
             if isinstance(detail, dict) and "equity" in detail:
                 out.append(detail)
             else:
-                unreadable += 1
+                at = event.created_at
+                if at.tzinfo is None:
+                    at = at.replace(tzinfo=timezone.utc)
+                if (since is None or at >= since) and (until is None or at < until):
+                    unreadable += 1
     return out, unreadable
 
 

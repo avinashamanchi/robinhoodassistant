@@ -58,7 +58,10 @@ def test_window_fill_counts_exclude_basis_fills(session_factory):
 def test_ambiguous_activity_invalidates_adjustment():
     rows = [point('2026-01-01T00:00:00+00:00', '1000', '100'),
             point('2026-01-02T00:00:00+00:00', '1100', '110', activity_coverage='complete',
-                  activities=[{'type': 'UNKNOWN', 'amount': '100', 'at': '2026-01-02T00:00:00+00:00'}])]
+                  activity_interval_start='2026-01-01T00:00:00+00:00',
+                  activities=[{'id': 'item-1', 'type': 'income', 'amount': '100', 'at': '2026-01-02T00:00:00+00:00'}])]
+    assert evaluate(rows, benchmark='SPY')['flow_adjusted_return_pct'] is not None
+    rows[1]['activities'][0]['type'] = 'UNKNOWN'
     assert evaluate(rows, benchmark='SPY')['flow_adjusted_return_pct'] is None
 
 
@@ -199,3 +202,59 @@ def test_fill_quality_excludes_untrusted_fills_and_reports_coverage(make_service
         report = build_report(session)
     report['fill_quality'] = quality
     assert 'fill-quality coverage: 1 trusted, 1 excluded untrusted, 1 with decision quote' in render_text(report)
+
+
+def test_invalid_identity_values_are_excluded_without_crashing():
+    for field in ('source', 'currency'):
+        for bad in ('', '   ', None, [], {}):
+            row = point('2026-01-01T00:00:00+00:00', '1000', '100')
+            row[field] = bad
+            later = point('2026-01-02T00:00:00+00:00', '1100', '110',
+                          activity_coverage='complete', activity_interval_start='2026-01-01T00:00:00+00:00', activities=[])
+            later[field] = bad
+            result = evaluate([row, later], benchmark='SPY')
+            assert result['invalid_rows'] == 2
+            assert result['snapshots'] == 0
+            assert not result['comparison_verified'] and not result['complete']
+
+
+def test_account_capital_and_currency_are_exported_for_one_or_more_points():
+    first = point('2026-01-01T00:00:00+00:00', '1000', '100')
+    second = point('2026-01-02T00:00:00+00:00', '1100', '110')
+    for rows, end in (([first], '1000'), ([first, second], '1100')):
+        result = evaluate(rows, benchmark='SPY')
+        assert Decimal(result['equity_start']) == Decimal('1000')
+        assert Decimal(result['equity_end']) == Decimal(end)
+        assert result['currency'] == 'USD'
+
+
+def test_unreadable_old_encrypted_snapshot_is_outside_selected_window(session_factory):
+    import json
+    from datetime import datetime, timezone
+    from trading_assistant.db.models import AuditEvent
+    from trading_assistant.security.sensitive_fields import sensitive_store
+    from trading_assistant.ops.equity import SNAPSHOT_ACTION, read_snapshots_with_coverage
+    start = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    end = datetime(2026, 1, 4, tzinfo=timezone.utc)
+    observations = [point('2026-01-02T00:00:00+00:00', '1000', '100'),
+                    point('2026-01-03T00:00:00+00:00', '1100', '110',
+                          activity_coverage='complete', activity_interval_start='2026-01-02T00:00:00+00:00', activities=[])]
+    with session_factory() as session:
+        store = sensitive_store(session, session_factory)
+        for index, (created, detail) in enumerate([
+            (datetime(2026, 1, 1, tzinfo=timezone.utc), 'not json'),
+            (start, json.dumps(observations[0])),
+            (datetime(2026, 1, 3, tzinfo=timezone.utc), json.dumps(observations[1]))]):
+            event = AuditEvent(actor='fixture', action=SNAPSHOT_ACTION, target_type='account',
+                               target_id='fixture', request_id=str(index), created_at=created)
+            store.write_many(event, {'reason': 'fixture', 'detail_json': detail})
+        session.commit()
+    rows, unreadable = read_snapshots_with_coverage(session_factory, since=start, until=end)
+    result = evaluate(rows, benchmark='SPY', since=start, until=end, unreadable_rows=unreadable)
+    assert result['unreadable_rows'] == 0
+    assert result['comparison_verified'] is True
+    assert result['snapshots'] == 2
+    _, unreadable_all = read_snapshots_with_coverage(session_factory)
+    assert unreadable_all == 1
+    _, unreadable_old = read_snapshots_with_coverage(session_factory, until=start)
+    assert unreadable_old == 1

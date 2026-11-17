@@ -47,6 +47,9 @@ def evaluate(snapshots, *, benchmark, since=None, until=None, unreadable_rows=0)
             if since and at < since.astimezone(timezone.utc) or until and at >= until.astimezone(timezone.utc):
                 continue
             equity = _number(item['equity'])
+            if any(not isinstance(item.get(key), str) or not item[key].strip()
+                   for key in ('source', 'currency')):
+                raise ValueError('invalid source or currency')
             if equity <= 0 or at in seen:
                 raise ValueError('invalid equity or duplicate timestamp')
             seen.add(at)
@@ -56,6 +59,7 @@ def evaluate(snapshots, *, benchmark, since=None, until=None, unreadable_rows=0)
     rows.sort(key=lambda row: row[0])
     result = {'snapshots': len(rows), 'excluded_rows': excluded, 'unreadable_rows': unreadable_rows,
               'invalid_rows': excluded - unreadable_rows, 'complete': False,
+              'equity_start': None, 'equity_end': None, 'currency': None,
               'flow_adjusted_return_pct': None, 'flow_adjusted_profit': None,
               'flow_adjusted_max_drawdown': None, 'flow_adjusted_max_drawdown_pct': None,
               'flow_adjusted_drawdown_units': 'initial equity scaled by chained return index',
@@ -64,6 +68,11 @@ def evaluate(snapshots, *, benchmark, since=None, until=None, unreadable_rows=0)
               'benchmark_status': 'unverified: missing, stale, mismatched, or legacy quote timestamp',
               'costs_status': 'account equity includes costs; activity coverage unverified',
               'method': 'Modified Dietz per interval, chained; estimate, not exact time-weighted return'}
+    if rows:
+        result['equity_start'] = str(rows[0][1])
+        result['equity_end'] = str(rows[-1][1])
+        currencies = {row[2]['currency'] for row in rows}
+        result['currency'] = next(iter(currencies)) if len(currencies) == 1 else None
     if len(rows) < 2:
         return result
     result['activity_coverage'] = {state: sum(row[2].get('activity_coverage', 'unknown') == state for row in rows[1:])
