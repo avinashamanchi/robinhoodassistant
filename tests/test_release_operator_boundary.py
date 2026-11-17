@@ -14,6 +14,8 @@ import pytest
         "from scripts import sync_release_evidence\n",
         "import importlib; importlib.import_module('scripts.sync_release_evidence')\n",
         "import runpy; runpy.run_path('scripts/sync_release_evidence.py')\n",
+        "import runpy; runpy.run_path('scripts/runtime_alerts.py')\n",
+        "import runpy; runpy.run_path('scripts/runtime_operations.py')\n",
     ],
 )
 def test_runtime_cannot_import_the_operator_transport(tmp_path, source):

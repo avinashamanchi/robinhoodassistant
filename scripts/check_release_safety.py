@@ -4419,8 +4419,9 @@ def _scan_operator_release_imports(root: Path) -> list[ReleaseViolation]:
                 ("spec_from_file_location",), ("SourceFileLoader",),
             ):
                 modules = [arg.value for arg in node.args if isinstance(arg, ast.Constant) and isinstance(arg.value, str)]
-            if any(value == "scripts" or value.startswith("scripts.")
-                   or "sync_release_evidence" in value for value in modules):
+            if any(value == "scripts" or value.startswith(("scripts.", "scripts/"))
+                   or any(name in value for name in ("sync_release_evidence", "runtime_alerts", "runtime_operations"))
+                   for value in modules):
                 findings.append(_finding("OPERATOR_TOOL_RUNTIME_IMPORT", relative, node.lineno))
     return findings
 

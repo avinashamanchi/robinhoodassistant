@@ -12,10 +12,19 @@ worktree — installation and broker ownership are tied to this source tree.
 Ruling: continue within the approved six-item scope without another design
 approval round — user explicitly requested implementation of that roadmap.
 
-Host selected by user: existing Mac, awake while plugged in, no hosting cost.
-No external notification destination has been assumed.
+Host selected by user: existing Mac, no hosting cost. On November 16 the user
+confirmed no charger is currently available and authorized continuing on battery
+(then approximately 98%). Temporary battery awake mode will expire after two
+hours or release at 30% battery; normal unattended mode remains AC-powered.
+User selected Telegram and authorized use/configuration of their bot. Managed
+connection `trading-alerts` is pending; no token or recipient has been assumed.
 
-- Task 1: implementation reviewed; CI and actual candidate-artifact handoff pending.
+- Task 1: complete — commit `22f9fe508ca7de4a73089f68516b753f7e5e0a2c`.
+  CI run `43924181965` passed all jobs; its actual canonical artifact was
+  authenticated, downloaded, digest-verified and published. The daemon's persisted
+  readiness report accepted the release requirement. Private acceptance receipt:
+  `.local/improvements/task1-acceptance.json`. Full suite: 5,231 passed, one
+  credentialed skip; selected safety-module coverage: 93.62%.
   - Shared canonical validator now protects the publisher and readiness consumer;
     a bare pass flag, partial or mismatched result cannot enable trading.
   - CI checks out the exact head and retains only its canonical verifier report.
@@ -39,7 +48,41 @@ No external notification destination has been assumed.
     substitute for importing the actual candidate report after successful CI.
   - Final handoff output will be saved privately outside tracked source, so
     recording acceptance does not itself invalidate the verified commit.
-- Task 2: pending.
+- Task 2: in progress — Mac power guard, private incident/health state, scheduled
+  receipt sync and isolated Telegram incident delivery. The app job was restored
+  using the canonical installer; app and daemon are reachable/running. An existing
+  `operator_global` latch was set automatically by `daemon:monitor` at 01:07 on
+  November 16 after three failed broker GETs. Reconciliation is currently clean;
+  preserve the latch until guarded recovery checks succeed. Do not silently reset
+  it. Telegram setup and physical long-term power remain external dependencies.
+  - Added private bounded atomic operational state, AC caffeinate ownership and
+    explicit expiring battery permission with low-battery/unknown-power release.
+    Real battery assertion observed through `pmset`; no global sleep setting changed.
+  - Read-only doctor persists deduplicated incidents, monitoring gaps and recovery
+    transitions. It checks app/heartbeat/reconciliation/breakers, jobs, release and
+    committed backup age. Active backup maintenance has a 15-minute bound; unknown
+    maintenance cannot suppress health observation.
+  - Separate managed-auth Telegram transport uses nonce-paired private human chat,
+    fixed sanitized event text, durable attempt claims and no ambiguous resend.
+    Real bot connection/pairing/test delivery remains pending user setup.
+  - Independent review reproduced Unicode pairing, unadvanced update offset and
+    suppressed unknown-maintenance bugs; regression tests now pass for all three.
+    Reviewer reports no remaining concrete Critical/Important finding.
+  - Live checks found filesystem device changed from 16777233 to 16777231 while
+    DB inode remained identical. Runtime refused correctly. Integrity/FK checks,
+    fresh verified encrypted backup and exact-file reselection restored binding.
+    Old control socket had identical inode/timestamps, absent PID and no listener;
+    it was quarantined privately. App liveness and clean broker reconciliation
+    were re-observed. No historical receipt or identity guard was weakened.
+    Private receipt: `.local/improvements/device-rebind-20261116.json`.
+  - All eight authorized runtime jobs are installed/loaded. Live doctor reports
+    app/database/heartbeat/reconciliation/jobs/recent-backup/monitor checks passing;
+    battery mode and unpaired Telegram remain explicit warnings. Safety latch is
+    retained and release proof is pending this candidate's CI.
+  - Focused runtime/backup/installer suite: 64 passed; operator-boundary and verifier
+    tests: 69 passed before the final manifest refresh. Static gate passed.
+    Full/security collections are pinned to 5,271 and 791 tests respectively.
+    Full local suite and final exact-commit CI acceptance remain in progress.
 - Task 3: pending.
 - Task 4: pending (month-long observation necessarily ongoing after tooling ships).
 - Task 5: pending.

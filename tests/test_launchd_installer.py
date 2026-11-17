@@ -106,7 +106,7 @@ def _make_checkout(root: Path) -> None:
 
 @pytest.fixture
 def installer(tmp_path: Path) -> Installer:
-    project = tmp_path / "trading assistant"
+    project = tmp_path / "trading & assistant"
     other = tmp_path / "other checkout"
     home = tmp_path / "home dir"
     fake_bin = tmp_path / "bin"
@@ -307,7 +307,7 @@ def test_installer_refuses_while_a_daemon_job_is_installed(installer, state):
 def test_uninstall_stops_the_watchdog_first_and_removes_every_job(installer):
     agents = installer.home / "Library" / "LaunchAgents"
     agents.mkdir(parents=True)
-    labels = ("app", "daemon", "watchdog", "backup", "autopilot")
+    labels = ("app", "daemon", "watchdog", "backup", "autopilot", "power", "doctor", "release-sync", "alerts")
     for label in labels:
         (agents / f"com.trading.{label}.plist").write_bytes(
             plistlib.dumps({"Label": f"com.trading.{label}"})
@@ -359,7 +359,7 @@ def test_with_daemon_installs_a_throttled_daemon_job(installer):
 
     assert completed.returncode == 0, completed.stderr
     plists = installer.plists()
-    assert set(plists) == {"com.trading.app", "com.trading.watchdog", "com.trading.backup", "com.trading.daemon"}
+    assert set(plists) == {"com.trading.app", "com.trading.watchdog", "com.trading.backup", "com.trading.daemon", "com.trading.power", "com.trading.doctor", "com.trading.release-sync", "com.trading.alerts"}
     daemon = plists["com.trading.daemon"]
     assert daemon["ProgramArguments"] == [
         str(installer.project / ".venv/bin/python"), "-m", "trading_assistant.daemon.main",
@@ -369,6 +369,12 @@ def test_with_daemon_installs_a_throttled_daemon_job(installer):
     assert daemon["KeepAlive"] == {"SuccessfulExit": False}
     assert daemon["ThrottleInterval"] == 300
     assert daemon["Umask"] == 0o77
+    assert plists["com.trading.power"]["KeepAlive"] is True
+    assert plists["com.trading.power"]["ProgramArguments"][-1] == "power-run"
+    assert plists["com.trading.doctor"]["StartInterval"] == 60
+    assert plists["com.trading.release-sync"]["StartInterval"] == 300
+    assert str(installer.home / ".composio") in plists["com.trading.release-sync"]["EnvironmentVariables"]["PATH"].split(":")
+    assert plists["com.trading.alerts"]["StartInterval"] == 60
 
 
 def test_with_daemon_still_refuses_an_unchosen_database(installer):

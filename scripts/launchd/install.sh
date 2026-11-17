@@ -89,6 +89,10 @@ reload_plist () {  # launchd can briefly return EIO immediately after bootout
   return 1
 }
 
+xml () {  # escape filesystem paths before inserting them in plist XML
+  printf '%s' "$1" | /usr/bin/sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
 emit () {  # $1=label  $2...=program args
   local label="$1"; shift
   local plist="$LA/$label.plist"
@@ -97,9 +101,9 @@ emit () {  # $1=label  $2...=program args
     printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
     printf '<plist version="1.0"><dict>\n'
     printf '  <key>Label</key><string>%s</string>\n' "$label"
-    printf '  <key>WorkingDirectory</key><string>%s</string>\n' "$PROJ"
+    printf '  <key>WorkingDirectory</key><string>%s</string>\n' "$(xml "$PROJ")"
     printf '  <key>ProgramArguments</key>\n  <array>\n'
-    for a in "$@"; do printf '    <string>%s</string>\n' "$a"; done
+    for a in "$@"; do printf '    <string>%s</string>\n' "$(xml "$a")"; done
     printf '  </array>\n'
     printf '  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin</string></dict>\n'
     printf '  <key>Umask</key><integer>63</integer>\n'
@@ -121,11 +125,15 @@ emit_periodic () {  # $1=label $2=interval_seconds $3...=program args
     printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
     printf '<plist version="1.0"><dict>\n'
     printf '  <key>Label</key><string>%s</string>\n' "$label"
-    printf '  <key>WorkingDirectory</key><string>%s</string>\n' "$PROJ"
+    printf '  <key>WorkingDirectory</key><string>%s</string>\n' "$(xml "$PROJ")"
     printf '  <key>ProgramArguments</key>\n  <array>\n'
-    for a in "$@"; do printf '    <string>%s</string>\n' "$a"; done
+    for a in "$@"; do printf '    <string>%s</string>\n' "$(xml "$a")"; done
     printf '  </array>\n'
+    if [ "$label" = com.trading.release-sync ] || [ "$label" = com.trading.alerts ]; then
+      printf '  <key>EnvironmentVariables</key><dict><key>PATH</key><string>%s:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin</string></dict>\n' "$(xml "$HOME/.composio")"
+    else
     printf '  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin</string></dict>\n'
+    fi
     printf '  <key>Umask</key><integer>63</integer>\n'
     printf '  <key>RunAtLoad</key><true/>\n'
     printf '  <key>StartInterval</key><integer>%s</integer>\n' "$interval"
@@ -147,9 +155,9 @@ emit_daily () {  # $1=label $2=hour $3=minute $4...=program args
     printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
     printf '<plist version="1.0"><dict>\n'
     printf '  <key>Label</key><string>%s</string>\n' "$label"
-    printf '  <key>WorkingDirectory</key><string>%s</string>\n' "$PROJ"
+    printf '  <key>WorkingDirectory</key><string>%s</string>\n' "$(xml "$PROJ")"
     printf '  <key>ProgramArguments</key>\n  <array>\n'
-    for a in "$@"; do printf '    <string>%s</string>\n' "$a"; done
+    for a in "$@"; do printf '    <string>%s</string>\n' "$(xml "$a")"; done
     printf '  </array>\n'
     printf '  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin</string></dict>\n'
     printf '  <key>Umask</key><integer>63</integer>\n'
@@ -173,9 +181,9 @@ emit_daemon () {  # restart only after an unsuccessful exit, at most every 5 min
     printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
     printf '<plist version="1.0"><dict>\n'
     printf '  <key>Label</key><string>%s</string>\n' "$label"
-    printf '  <key>WorkingDirectory</key><string>%s</string>\n' "$PROJ"
+    printf '  <key>WorkingDirectory</key><string>%s</string>\n' "$(xml "$PROJ")"
     printf '  <key>ProgramArguments</key>\n  <array>\n'
-    printf '    <string>%s</string>\n' "$PY" "-m" "trading_assistant.daemon.main"
+    printf '    <string>%s</string>\n' "$(xml "$PY")" "-m" "trading_assistant.daemon.main"
     printf '  </array>\n'
     printf '  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin</string></dict>\n'
     printf '  <key>Umask</key><integer>63</integer>\n'
@@ -193,6 +201,10 @@ emit_daemon () {  # restart only after an unsuccessful exit, at most every 5 min
 emit com.trading.app "$PY" -m trading_assistant.ops.serve
 if [ "$WITH_DAEMON" = 1 ]; then
   emit_daemon
+  emit com.trading.power "$PY" "$PROJ/scripts/runtime_operations.py" power-run
+  emit_periodic com.trading.doctor 60 "$PY" "$PROJ/scripts/runtime_operations.py" doctor
+  emit_periodic com.trading.release-sync 300 "$PY" "$PROJ/scripts/sync_release_evidence.py" sync --repository avinashamanchi/robinhoodassistant
+  emit_periodic com.trading.alerts 60 "$PY" "$PROJ/scripts/runtime_alerts.py" deliver
 fi
 # Give fresh runtimes time to acquire tenure before watchdog startup checks.
 sleep 10
