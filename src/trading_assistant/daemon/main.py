@@ -214,11 +214,15 @@ def _build_campaign_capture(config, service, guard, root=None, *, config_fingerp
     from ..autopilot.identity import config_fingerprint as config_identity, decision_code_fingerprint, code_identity
     from ..installation import source_root
     from ..ops.acceptance_campaign import CampaignCapture, read_reconciliation, read_daemon_order_reconciliation, read_position_reconciliation
+    from ..ops.campaign_transitions import read_lifecycle, read_recovery, read_mock_drill
+    from ..ops.release_evidence import clean_commit
     from ..ops.operational_state import StateStore
     config_fingerprint = config_fingerprint or config_identity
     code_fingerprint = code_fingerprint or decision_code_fingerprint
     scope = {"mode": config.autopilot.mode, "config_fingerprint": config_fingerprint(config),
              "code_fingerprint": code_fingerprint(config.autopilot.strategy)}
+    campaign_root = root or source_root()
+    runtime_code = code_identity(campaign_root)
     def order_reconciliation(at):
         if config.trading.broker.value != "alpaca":
             return "unknown", "0" * 64
@@ -234,12 +238,22 @@ def _build_campaign_capture(config, service, guard, root=None, *, config_fingerp
             return "unknown", "0" * 64
         return read_position_reconciliation(service.session_factory, at, config.trading.reconciliation_max_age_seconds)
 
-    return CampaignCapture(StateStore(root or source_root()), service.market_clock(AssetClass.EQUITY),
+    def transitions(cycles, start, at):
+        real = config.trading.broker.value == "alpaca" and config.trading.mode.value == "paper"
+        lifecycle = read_lifecycle(service.session_factory, cycles, scope, start, at) if real else {"outcome": "unknown"}
+        recovery = read_recovery(service.session_factory, start, at) if real else {"outcome": "unknown"}
+        try:
+            mock = read_mock_drill(campaign_root, runtime_code, at) if runtime_code and clean_commit(campaign_root) == runtime_code else {"outcome": "unknown"}
+        except Exception:
+            mock = {"outcome": "unknown"}
+        return {"lifecycle": lifecycle, "recovery": recovery, "safety_drill": mock}
+
+    return CampaignCapture(StateStore(campaign_root), service.market_clock(AssetClass.EQUITY),
                            EvidenceStore(service.session_factory, actor="campaign"), scope, guard,
                            delay_minutes=getattr(config.autopilot, "run_after_open_minutes", 30),
                            reconciliation_reader=startup_reconciliation,
                            order_reconciliation_reader=order_reconciliation, position_reconciliation_reader=position_reconciliation,
-                           runtime_code=code_identity(root or source_root()))
+                           runtime_code=runtime_code, transition_reader=transitions)
 
 
 def _build_autopilot_runner(

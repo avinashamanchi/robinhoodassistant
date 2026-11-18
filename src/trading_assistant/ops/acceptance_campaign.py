@@ -15,7 +15,7 @@ CHECK_METHODS = {
     "runtime_health": {"real_local_runtime"},
     "backup": {"real_local_backup"},
     "safety_drill": {"isolated_mock_drill"},
-    "lifecycle": {"real_local_runtime"},
+    "lifecycle": {"persisted_broker_lifecycle"},
     "recovery": {"real_local_runtime"},
 }
 SOURCES = {"daemon_reconciliation", "audit_reconciliation", "runtime_doctor", "backup", "safety_drill", "operator", "broker"}
@@ -189,7 +189,8 @@ def evaluate(campaign, now, calendar, cycles, *, evidence_complete=False, delay_
         receipt = max(matching, key=lambda r: _time(r.get("captured_at", r["observed_at"]))) if matching else None
         latest_receipts[name] = receipt
         # Current status expires conservatively; history retains its original outcome.
-        fresh = receipt is not None and start <= _time(receipt["observed_at"]) and timedelta(0) <= now - _time(receipt["observed_at"]) <= timedelta(minutes=3)
+        freshness_time = receipt.get("captured_at", receipt["observed_at"]) if receipt and name in {"lifecycle", "recovery", "safety_drill"} else receipt["observed_at"] if receipt else None
+        fresh = receipt is not None and start <= _time(receipt["observed_at"]) and timedelta(0) <= now - _time(freshness_time) <= timedelta(minutes=3)
         checks[name] = receipt["outcome"] if fresh and campaign.get("current_scope", scope) == scope else "unknown"
     observations = campaign.get("observations", [])
     times = [_time(o.get("t", o.get("at"))) for o in observations]
@@ -243,7 +244,7 @@ if __name__ == "__main__":
 
 class CampaignCapture:
     """Runs only in the existing daemon; never calls an order or broker mutation."""
-    def __init__(self, store, clock, evidence, scope, guard, *, now=None, delay_minutes=30, reconciliation_reader=None, order_reconciliation_reader=None, position_reconciliation_reader=None, runtime_code=None):
+    def __init__(self, store, clock, evidence, scope, guard, *, now=None, delay_minutes=30, reconciliation_reader=None, order_reconciliation_reader=None, position_reconciliation_reader=None, runtime_code=None, transition_reader=None):
         self.store, self.clock, self.evidence = store, clock, evidence
         self.scope, self.guard = _scope(scope), guard
         self.now = now or (lambda: datetime.now(timezone.utc))
@@ -254,6 +255,7 @@ class CampaignCapture:
         self.order_reconciliation_reader = order_reconciliation_reader
         self.position_reconciliation_reader = position_reconciliation_reader
         self.runtime_code = runtime_code if isinstance(runtime_code, str) and re.fullmatch(r"[a-f0-9]{40}", runtime_code) else "unknown"
+        self.transition_reader = transition_reader
         self._last = None
 
     def capture(self):
@@ -287,9 +289,10 @@ class CampaignCapture:
                 calendar_at = at.isoformat()
             else:
                 calendar = campaign.get("calendar")
-            rows, unreadable = [], False
+            rows, unreadable, raw_cycles = [], False, []
             try:
-                for record in self.evidence.cycles():
+                raw_cycles = self.evidence.cycles()
+                for record in raw_cycles:
                     created = _time(record.created_at.replace(tzinfo=timezone.utc) if record.created_at.tzinfo is None else record.created_at)
                     if not start <= created <= at:
                         continue
@@ -414,6 +417,33 @@ class CampaignCapture:
                 receipts.append({"check": "broker_position_reconciliation", "method": "persisted_broker_reconciliation", "source": "audit_reconciliation",
                                  "outcome": outcome, "observed_at": source_at.isoformat(), "captured_at": at.isoformat(), "scope": self.scope,
                                  "reference": "sha256:" + digest})
+            if self.transition_reader is not None:
+                specs = {"lifecycle": ("persisted_broker_lifecycle", "encrypted_lifecycle", {"paper_order_filled_exact"}),
+                         "recovery": ("real_local_runtime", "encrypted_breaker_audit", {"operator_global_reset", "broker_drift_reset"}),
+                         "safety_drill": ("isolated_mock_drill", "validated_ci_handoff", {"ci_isolated_mock_drill"})}
+                try:
+                    transitions = self.transition_reader(raw_cycles, start, at)
+                    if not isinstance(transitions, dict):
+                        raise ValueError("invalid transition observations")
+                except Exception:
+                    transitions = {}
+                for name, (method, source, allowed) in specs.items():
+                    result = transitions.get(name, {})
+                    try:
+                        outcome = result.get("outcome")
+                        observed = _time(result["observed_at"])
+                        transition = result.get("transition")
+                        reference = result.get("reference")
+                        if outcome != "pass" or transition not in allowed or observed > at or not isinstance(reference, str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", reference):
+                            raise ValueError("invalid transition")
+                    except (KeyError, TypeError, ValueError):
+                        outcome, observed, transition = "unknown", at, "unknown"
+                        reference = "sha256:" + hashlib.sha256((name + "_unavailable").encode()).hexdigest()
+                    receipts.append({"check": name, "method": method, "source": source, "outcome": outcome,
+                                     "transition": transition, "observed_at": observed.isoformat(), "captured_at": at.isoformat(),
+                                     "time_basis": "verifier_finish_before_ci_drill" if name == "safety_drill" and outcome == "pass" else "event_time" if outcome == "pass" else "capture_time",
+                                     "code_version": result.get("code_version") if outcome == "pass" and isinstance(result.get("code_version"), str) and re.fullmatch(r"[a-f0-9]{40}", result["code_version"]) else self.runtime_code,
+                                     "scope": self.scope, "reference": reference})
             if self.guard is not None:
                 self.guard.ensure_owned()
             def save(old):
@@ -430,7 +460,7 @@ class CampaignCapture:
                 coalesced = old.get("coalesced_receipts", 0)
                 for receipt in receipts:
                     prior = next((i for i in range(len(all_receipts)-1, -1, -1) if all_receipts[i]["check"] == receipt["check"]), None)
-                    if prior is not None and all_receipts[prior]["outcome"] == receipt["outcome"] and all_receipts[prior]["observed_at"][:10] == receipt["observed_at"][:10]:
+                    if prior is not None and all_receipts[prior]["outcome"] == receipt["outcome"] and all_receipts[prior].get("transition") == receipt.get("transition") and all_receipts[prior]["observed_at"][:10] == receipt["observed_at"][:10] and ("transition" not in receipt or all_receipts[prior]["reference"] == receipt["reference"]):
                         all_receipts.pop(prior)
                         coalesced += 1
                     all_receipts.append(receipt)
