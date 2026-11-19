@@ -22,13 +22,13 @@ fingerprint), so the daemon can tell whether a session's cycle already ran.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import hashlib
 import json
 from typing import Any, Iterable
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from ..db.models import AuditEvent
 from ..operations.audit import AuditRecorder, MutationContext
@@ -137,6 +137,57 @@ class EvidenceStore:
 
     def cycles(self, *, key: str | None = None) -> list[EvidenceRecord]:
         return self._load(CYCLE_ACTION, key=key)
+
+    def cycles_in_window(self, start: datetime, end: datetime, *, limit: int = 100, scope: dict | None = None) -> tuple[list[EvidenceRecord], bool]:
+        """Bound the source query before reading any encrypted cycle details."""
+        if start.utcoffset() is None or end.utcoffset() is None or start > end or type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("invalid cycle evidence window")
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo("America/New_York")
+        first, last = start.astimezone(zone).date(), end.astimezone(zone).date()
+        query = select(AuditEvent.id, func.length(AuditEvent.detail_json)).where(
+            AuditEvent.action == CYCLE_ACTION, AuditEvent.target_type == "autopilot",
+            AuditEvent.target_id >= first.isoformat(), AuditEvent.target_id <= last.isoformat(),
+            AuditEvent.created_at >= start, AuditEvent.created_at < end,
+        )
+        if scope is not None:
+            from .identity import evidence_fingerprint
+            if (last-first).days > 31 or set(scope) != {"mode", "config_fingerprint", "code_fingerprint"}:
+                raise ValueError("invalid scoped cycle window")
+            fingerprint = evidence_fingerprint(scope["config_fingerprint"], scope["code_fingerprint"])
+            keys = [cycle_key(scope["mode"], first + timedelta(days=i), fingerprint) for i in range((last-first).days + 1)]
+            query = query.where(AuditEvent.idempotency_key.in_(keys))
+        with self.session_factory() as session:
+            if session.bind.dialect.name == "sqlite":
+                session.connection().exec_driver_sql("BEGIN")
+            ids = list(session.execute(query.order_by(AuditEvent.id.desc()).limit(limit + 1)))
+            overflow = len(ids) > limit
+            store = sensitive_store(session, self.session_factory)
+            records = []
+            for event_id, size in reversed(ids[:limit]):
+                if type(size) is not int or size > 65536:
+                    overflow = True
+                    continue
+                event = session.get(AuditEvent, event_id)
+                if event is None:
+                    overflow = True
+                    continue
+                try:
+                    detail = json.loads(store.read(event, "detail_json"))
+                except Exception:
+                    detail = {"unreadable": True}
+                if scope is not None and isinstance(detail, dict) and not detail.get("unreadable"):
+                    try:
+                        day = date.fromisoformat(detail["session"])
+                        if event.target_id != detail["session"] or event.idempotency_key != cycle_key(scope["mode"], day, fingerprint):
+                            overflow = True
+                            continue
+                    except (KeyError, TypeError, ValueError):
+                        overflow = True
+                        continue
+                records.append(EvidenceRecord(event.result_code, event.created_at, event.idempotency_key,
+                                              detail if isinstance(detail, dict) else {"unreadable": True}))
+            return records, overflow
 
     def backtests(self) -> list[EvidenceRecord]:
         return self._load(BACKTEST_ACTION)

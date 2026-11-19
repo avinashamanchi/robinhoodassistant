@@ -34,7 +34,7 @@ def _date(value):
     return parsed.replace(tzinfo=timezone.utc) if parsed.utcoffset() is None else parsed.astimezone(timezone.utc)
 
 
-def record_checks(store, checks, now):
+def record_checks(store, checks, now, *, cipher=None):
     at = stamp(now)
     checks = [dict(c) for c in checks]
     for check in checks:
@@ -44,13 +44,25 @@ def record_checks(store, checks, now):
                 or set(check) != {"component", "code", "status"}):
             raise ValueError("unknown health check")
     def change(previous):
+        from trading_assistant.ops.state_attestation import seal_doctor_health, verify_doctor_health
+        def publish(value, *, previous_verified):
+            if cipher is None:
+                return value
+            try:
+                return seal_doctor_health(value, cipher, previous_verified=previous_verified)
+            except Exception:
+                # Preserve conservative failures, but never retain a stale tag.
+                return {k: v for k, v in value.items() if k != "doctor_publication"}
+        previous_verified = verify_doctor_health(previous, cipher)
         last = previous.get("checked_at")
         if last is not None and now <= _date(last):
-            return {**previous, "stale_observations": min(previous.get("stale_observations", 0) + 1, 1000000000)}
+            value = {**previous, "stale_observations": min(previous.get("stale_observations", 0) + 1, 1000000000)}
+            return publish(value, previous_verified=True) if previous_verified else value
         incidents = previous.get("incidents", {})
         events = previous.get("events", [])
         gap = last is not None and not 0 <= (now - _date(last)).total_seconds() <= 180
-        effective = checks + [{"component":"monitor", "status":"fail" if gap else "pass",
+        monitor_status = "fail" if gap else "unknown" if cipher is not None and not previous_verified else "pass"
+        effective = checks + [{"component":"monitor", "status":monitor_status,
                                "code":"monitoring_gap" if gap else "monitoring_current"}]
         for check in effective:
             component = check["component"]
@@ -68,9 +80,12 @@ def record_checks(store, checks, now):
                 old.update(state="resolved", resolved_at=at, last_seen_at=at)
                 events.append({"id":uuid.uuid4().hex, "incident_id":old["id"],
                                "component":component, "code":check["code"], "state":"resolved", "at":at})
-        return {"schema_version":1, "checked_at":at, "checks":effective, "incidents":incidents,
+        value = {"schema_version":1, "checked_at":at, "checks":effective, "incidents":incidents,
                 "stale_observations":previous.get("stale_observations", 0),
                 "events":events[-100:], "discarded_events":previous.get("discarded_events",0)+max(0,len(events)-100)}
+        if cipher is not None:
+            value["legacy_history_unverified"] = bool(previous.get("legacy_history_unverified", False) or (previous and not previous_verified))
+        return publish(value, previous_verified=previous_verified)
     return store.update("health", change)
 
 
@@ -195,22 +210,22 @@ def power_run(store, stop=None):
         controller.close()
 
 
-def doctor(root, store, now):
+def doctor(root, store, now, *, cipher=None):
     with store.lease("doctor-owner"):
         previous = store.load("health")
         if previous.get("checked_at") and now <= _date(previous["checked_at"]):
-            return record_checks(store, [], now)
-        return _doctor(root, store, now)
+            return record_checks(store, [], now, cipher=cipher)
+        return _doctor(root, store, now, cipher=cipher)
 
 
-def _doctor(root, store, now):
+def _doctor(root, store, now, *, cipher=None):
     maintenance = maintenance_state(root)
     if maintenance == "active":
         observed = store.update("maintenance",lambda old: old if old.get("active_since") else {"active_since":stamp(now)})
         elapsed = (now - _date(observed["active_since"])).total_seconds()
         stalled = not 0 <= elapsed <= 900
         return record_checks(store,[{"component":"maintenance", "status":"fail" if stalled else "pass",
-                                     "code":"backup_stalled" if stalled else "backup_running"}],now)
+                                     "code":"backup_stalled" if stalled else "backup_running"}],now,cipher=cipher)
     store.update("maintenance",lambda _: {})
     checks = database_checks(root, now)
     checks.append({"component":"maintenance","status":"warn" if maintenance == "unknown" else "pass",
@@ -245,7 +260,7 @@ def _doctor(root, store, now):
     except Exception:
         verified = False
     checks.append({"component":"release","status":"pass" if verified else "warn", "code":"release_verified" if verified else "release_unverified"})
-    return record_checks(store, checks, now)
+    return record_checks(store, checks, now, cipher=cipher)
 
 
 def main(argv=None):
@@ -273,7 +288,15 @@ def main(argv=None):
             power_run(store,stop)
             return 0
         elif args.command == "doctor":
-            result = doctor(root,store,now)
+            try:
+                from trading_assistant.config import load_config
+                from trading_assistant.security.secrets import load_role_secrets
+                from trading_assistant.security.crypto import build_sensitive_data_cipher
+                config = load_config()
+                cipher = build_sensitive_data_cipher(config.encryption, load_role_secrets("backup", config=config))
+            except Exception:
+                cipher = None
+            result = doctor(root,store,now,cipher=cipher)
         else:
             result = {"power":store.load("power"),"health":store.load("health")}
         print(json.dumps(result,sort_keys=True))

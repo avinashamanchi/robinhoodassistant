@@ -1523,6 +1523,8 @@ class TradingService(OrderCancellationMixin):
                 audit_reason=reason,
             )
         with self.session_factory() as session:
+            campaign_at = utcnow()
+            campaign_result = "reconciled" if result["failed"] == 0 else "reconciliation_required"
             _persist_audit(
                     session,
                     actor=actor,
@@ -1531,11 +1533,8 @@ class TradingService(OrderCancellationMixin):
                     target_id="all",
                     request_id=request_id,
                     reason=reason,
-                    result_code=(
-                        "reconciled"
-                        if result["failed"] == 0
-                        else "reconciliation_required"
-                    ),
+                    result_code=campaign_result,
+                    created_at=campaign_at,
                     detail_json=json.dumps(
                         {
                             "resolved_unknown": result["resolved_unknown"],
@@ -1545,6 +1544,12 @@ class TradingService(OrderCancellationMixin):
                             "synced_orders": result["synced_orders"],
                             "inserted_fills": result["inserted_fills"],
                             "broker_drift": result["broker_drift"],
+                            "campaign_failed_count": result["failed"],
+                            "campaign_plan_cancel_failures": plan_cancel_failures,
+                            "campaign_observation": {"schema": 1, "action": "orders.sync", "target": "broker_orders:all",
+                                "broker": self.broker.reconciliation_key, "configured_broker": self.config.trading.broker.value,
+                                "mode": self.config.trading.mode.value, "result": campaign_result, "request_id": request_id,
+                                "observed_at": campaign_at.isoformat()},
                         },
                         sort_keys=True,
                     ),
@@ -1842,6 +1847,8 @@ class TradingService(OrderCancellationMixin):
                         request_id=request_id,
                         audit_reason=reason,
                     )
+                campaign_at = utcnow()
+                campaign_result = "reconciled" if not drift else "drift_detected"
                 _persist_audit(
                         session,
                         actor=actor,
@@ -1850,11 +1857,13 @@ class TradingService(OrderCancellationMixin):
                         target_id="all",
                         request_id=request_id,
                         reason=reason,
-                        result_code=(
-                            "reconciled" if not drift else "drift_detected"
-                        ),
+                        result_code=campaign_result,
+                        created_at=campaign_at,
                         detail_json=json.dumps(
-                            {"drift": drift},
+                            {"drift": drift, "campaign_observation": {"schema": 1, "action": "positions.reconcile", "target": "portfolio:all",
+                                "broker": self.broker.reconciliation_key, "configured_broker": self.config.trading.broker.value,
+                                "mode": self.config.trading.mode.value, "result": campaign_result, "request_id": request_id,
+                                "observed_at": campaign_at.isoformat()}},
                             sort_keys=True,
                         ),
                 )

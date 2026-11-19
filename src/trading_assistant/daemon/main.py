@@ -204,16 +204,16 @@ def _finish_monitor(
         autopilot=autopilot,
         autopilot_timeout_seconds=config.autopilot.cycle_timeout_seconds,
         equity_recorder=EquitySnapshotRecorder(service),
-        campaign_capture=_build_campaign_capture(config, service, runtime_tenure_guard),
+        campaign_capture=_build_campaign_capture(config, service, runtime_tenure_guard, secrets=secrets),
     )
 
 
-def _build_campaign_capture(config, service, guard, root=None, *, config_fingerprint=None, code_fingerprint=None):
+def _build_campaign_capture(config, service, guard, root=None, *, config_fingerprint=None, code_fingerprint=None, secrets=None):
     from ..assets import AssetClass
     from ..autopilot.evidence import EvidenceStore
     from ..autopilot.identity import config_fingerprint as config_identity, decision_code_fingerprint, code_identity
     from ..installation import source_root
-    from ..ops.acceptance_campaign import CampaignCapture, read_reconciliation, read_daemon_order_reconciliation, read_position_reconciliation
+    from ..ops.acceptance_campaign import CampaignCapture, read_reconciliation, read_daemon_order_reconciliation, read_position_reconciliation, read_backup_artifacts
     from ..ops.campaign_transitions import read_lifecycle, read_recovery, read_mock_drill
     from ..ops.release_evidence import clean_commit
     from ..ops.operational_state import StateStore
@@ -223,6 +223,18 @@ def _build_campaign_capture(config, service, guard, root=None, *, config_fingerp
              "code_fingerprint": code_fingerprint(config.autopilot.strategy)}
     campaign_root = root or source_root()
     runtime_code = code_identity(campaign_root)
+    if secrets is not None:
+        from ..security.crypto import build_sensitive_data_cipher
+        try:
+            cipher = build_sensitive_data_cipher(config.encryption, secrets)
+        except Exception:
+            # Campaign collection must not interrupt the trading safety loop or
+            # create unauthenticated operational evidence when keys are absent.
+            import logging
+            logging.getLogger(__name__).warning("campaign_cipher_unavailable")
+            return None
+    else:
+        cipher = None
     def order_reconciliation(at):
         if config.trading.broker.value != "alpaca":
             return "unknown", "0" * 64
@@ -253,7 +265,8 @@ def _build_campaign_capture(config, service, guard, root=None, *, config_fingerp
                            delay_minutes=getattr(config.autopilot, "run_after_open_minutes", 30),
                            reconciliation_reader=startup_reconciliation,
                            order_reconciliation_reader=order_reconciliation, position_reconciliation_reader=position_reconciliation,
-                           runtime_code=runtime_code, transition_reader=transitions)
+                           backup_reader=lambda at: read_backup_artifacts(campaign_root, at),
+                           runtime_code=runtime_code, transition_reader=transitions, cipher=cipher)
 
 
 def _build_autopilot_runner(

@@ -9,6 +9,12 @@ from trading_assistant.security.sensitive_fields import persist_sensitive
 from trading_assistant.service_support import _persist_audit
 from trading_assistant.ops.campaign_transitions import read_lifecycle, read_recovery, read_mock_drill
 
+class FakeEvidence:
+    def cycles_in_window(self, start, end, *, limit, scope=None):
+        rows = self.cycles()
+        return rows[:limit], len(rows) > limit
+
+
 NOW = datetime(2026, 11, 17, 12, tzinfo=timezone.utc)
 SCOPE = {"mode": "paper", "config_fingerprint": "a" * 64, "code_fingerprint": "b" * 64}
 
@@ -117,6 +123,29 @@ def test_recovery_rejects_tamper_and_contradictory_current_state(session_factory
     assert read_recovery(session_factory, NOW, NOW + timedelta(minutes=1))["outcome"] == "unknown"
 
 
+def test_recovery_rejects_actor_mismatch_and_newer_unreadable_other_scope(session_factory):
+    import sqlite3
+    from trading_assistant.db.models import CircuitBreakerState
+    from trading_assistant.risk.breakers import BreakerScope, BreakerService
+    breakers = BreakerService(session_factory)
+    health = {"captured_at": NOW.isoformat(), "remote_open_orders": 0, "local_enumeration": "confirmed", "other_active_breakers": [],
+              "order_reconciliation": "clean", "position_reconciliation": "clean"}
+    first = breakers.trip(BreakerScope.operator_global(), "fixture", "daemon", request_id="trip", now=NOW)
+    breakers.reset(BreakerScope.operator_global(), actor="operator", reason="fixture", prior_health=health,
+                   expected_generation=first.generation, request_id="reset", now=NOW + timedelta(seconds=1))
+    with session_factory.begin() as session:
+        session.get(CircuitBreakerState, "operator_global").actor = "different"
+    assert read_recovery(session_factory, NOW, NOW + timedelta(minutes=1))["outcome"] == "unknown"
+    with session_factory.begin() as session:
+        session.get(CircuitBreakerState, "operator_global").actor = "operator"
+    second = breakers.trip(BreakerScope.broker_drift(), "fixture", "daemon", request_id="trip2", now=NOW + timedelta(seconds=2))
+    breakers.reset(BreakerScope.broker_drift(), actor="operator", reason="fixture", prior_health=health,
+                   expected_generation=second.generation, request_id="reset2", now=NOW + timedelta(seconds=3))
+    with sqlite3.connect(session_factory.kw["bind"].url.database) as connection:
+        connection.execute("UPDATE audit_events SET detail_json='bad' WHERE action='circuit_breaker.reset' AND target_id='broker_drift'")
+    assert read_recovery(session_factory, NOW, NOW + timedelta(minutes=1))["outcome"] == "unknown"
+
+
 def test_mock_drill_requires_validated_matching_report_and_importer_provenance(tmp_path):
     import hashlib
     import json
@@ -144,55 +173,55 @@ def test_mock_drill_requires_validated_matching_report_and_importer_provenance(t
     assert read_mock_drill(tmp_path, "a" * 40, datetime(2026, 10, 2, tzinfo=timezone.utc))["outcome"] == "unknown"
 
 
-def test_transition_receipts_remain_historical_and_revalidate_current_state(tmp_path):
+def test_transition_receipts_remain_historical_and_revalidate_current_state(tmp_path, sensitive_cipher):
     from trading_assistant.ops.acceptance_campaign import CampaignCapture, report_for_store
     from trading_assistant.ops.operational_state import StateStore
     class Clock:
         def session_range(self, start, end):
             return {"start": start.isoformat(), "end": end.isoformat(), "source": "alpaca_calendar", "sessions": []}
-    class Evidence:
+    class Evidence(FakeEvidence):
         def cycles(self): return []
     at = [NOW]
     outcome = ["pass"]
     def transitions(_cycles, _start, _now):
         return {"recovery": {"outcome": outcome[0], "transition": "operator_global_reset", "observed_at": NOW.isoformat(), "reference": "sha256:" + "a" * 64}}
     store = StateStore(tmp_path)
-    capture = CampaignCapture(store, Clock(), Evidence(), SCOPE, None, now=lambda: at[0], transition_reader=transitions)
+    capture = CampaignCapture(store, Clock(), Evidence(), SCOPE, None, now=lambda: at[0], transition_reader=transitions, cipher=sensitive_cipher)
     capture.capture()
     at[0] += timedelta(minutes=10)
     capture.capture()
-    report = report_for_store(store, at[0])
+    report = report_for_store(store, at[0], cipher=sensitive_cipher)
     assert report["checks"]["recovery"] == "pass"
     assert report["latest_receipts"]["recovery"]["observed_at"] == NOW.isoformat()
     outcome[0] = "unknown"
     at[0] += timedelta(minutes=1)
     capture.capture()
-    assert report_for_store(store, at[0])["checks"]["recovery"] == "unknown"
+    assert report_for_store(store, at[0], cipher=sensitive_cipher)["checks"]["recovery"] == "unknown"
 
 
-def test_encrypted_lifecycle_proof_flows_into_persisted_campaign(session_factory, tmp_path):
+def test_encrypted_lifecycle_proof_flows_into_persisted_campaign(session_factory, tmp_path, sensitive_cipher):
     from trading_assistant.ops.acceptance_campaign import CampaignCapture, report_for_store, start_campaign
     from trading_assistant.ops.operational_state import StateStore
     class Clock:
         def session_range(self, start, end):
             return {"start": start.isoformat(), "end": end.isoformat(), "source": "alpaca_calendar", "sessions": []}
     order_id = make_order(session_factory)
-    class Evidence:
+    class Evidence(FakeEvidence):
         def cycles(self): return [cycle(order_id)]
     now = [NOW + timedelta(minutes=1)]
     store = StateStore(tmp_path)
-    start_campaign(store, NOW, SCOPE)
+    start_campaign(store, NOW, SCOPE, cipher=sensitive_cipher)
     capture = CampaignCapture(store, Clock(), Evidence(), SCOPE, None, now=lambda: now[0],
-        transition_reader=lambda cycles, start, at: {"lifecycle": read_lifecycle(session_factory, cycles, SCOPE, start, at)})
+        transition_reader=lambda cycles, start, at: {"lifecycle": read_lifecycle(session_factory, cycles, SCOPE, start, at)}, cipher=sensitive_cipher)
     capture.capture()
-    report = report_for_store(store, now[0])
+    report = report_for_store(store, now[0], cipher=sensitive_cipher)
     assert report["checks"]["lifecycle"] == "pass"
     assert report["latest_receipts"]["lifecycle"]["method"] == "persisted_broker_lifecycle"
     with session_factory.begin() as session:
         session.get(Order, order_id).status = "canceled"
     now[0] += timedelta(minutes=1)
     capture.capture()
-    assert report_for_store(store, now[0])["checks"]["lifecycle"] == "unknown"
+    assert report_for_store(store, now[0], cipher=sensitive_cipher)["checks"]["lifecycle"] == "unknown"
 
 
 def test_lifecycle_rejects_naive_and_future_cycle_evidence(session_factory):
@@ -213,3 +242,41 @@ def test_lifecycle_reads_production_encrypted_cycle_and_order_proof(session_fact
     evidence.record_cycle(key=supplied.idempotency_key, session=NOW.date(), result_code="executed", detail=supplied.detail)
     now = max(datetime.now(timezone.utc) + timedelta(minutes=1), NOW + timedelta(minutes=1))
     assert read_lifecycle(session_factory, evidence.cycles(), SCOPE, NOW, now)["outcome"] == "pass"
+
+
+def test_lifecycle_records_each_order_when_second_is_not_terminal(session_factory, tmp_path, sensitive_cipher):
+    from dataclasses import replace
+    first = make_order(session_factory)
+    with session_factory.begin() as session:
+        order = Order(idempotency_key="other-order", ticker="MSFT", side="buy", order_type="market", qty=Decimal("1"),
+                      status="submitted", broker_order_id="other", acceptance_state="accepted", created_at=NOW, updated_at=NOW)
+        persist_sensitive(session, order, {"approval_reason": "fixture"})
+        second = order.id
+    original = cycle(first)
+    multi = replace(original, detail={**original.detail, "orders": [{"order_id": first}, {"order_id": second}]})
+    result = read_lifecycle(session_factory, [multi], SCOPE, NOW, NOW + timedelta(minutes=1))
+    assert result["outcome"] == "pass"
+    assert [r["outcome"] for r in result["orders"]] == ["pass", "unknown"]
+    assert all(r["order_digest"].startswith("sha256:") for r in result["orders"])
+    from trading_assistant.ops.acceptance_campaign import CampaignCapture, report_for_store, start_campaign
+    from trading_assistant.ops.operational_state import StateStore
+    class Clock:
+        def session_range(self, start, end):
+            return {"start": start.isoformat(), "end": end.isoformat(), "source": "alpaca_calendar", "sessions": []}
+    class Evidence(FakeEvidence):
+        def cycles(self): return [multi]
+    state = StateStore(tmp_path)
+    start_campaign(state, NOW, SCOPE, cipher=sensitive_cipher)
+    capture = CampaignCapture(state, Clock(), Evidence(), SCOPE, None, now=lambda: NOW + timedelta(minutes=1), cipher=sensitive_cipher,
+        transition_reader=lambda cycles, start, at: {"lifecycle": read_lifecycle(session_factory, cycles, SCOPE, start, at)})
+    capture.capture()
+    receipt = report_for_store(state, NOW + timedelta(minutes=1), cipher=sensitive_cipher)["latest_receipts"]["lifecycle"]
+    assert [item["outcome"] for item in receipt["orders"]] == ["pass", "unknown"]
+
+
+def test_duplicate_cycle_does_not_duplicate_order_transition(session_factory):
+    order_id = make_order(session_factory)
+    item = cycle(order_id)
+    result = read_lifecycle(session_factory, [item, item], SCOPE, NOW, NOW + timedelta(minutes=1))
+    assert result["outcome"] == "pass"
+    assert len(result["orders"]) == 1

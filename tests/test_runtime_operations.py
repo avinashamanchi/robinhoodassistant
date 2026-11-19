@@ -51,6 +51,53 @@ def test_stale_doctor_does_not_clear_newer_maintenance_state(tmp_path):
     assert store.load("health")["incidents"]["daemon"]["state"] == "open"
 
 
+def test_doctor_publication_authenticates_new_checks_and_rejects_tamper(tmp_path, sensitive_cipher):
+    from trading_assistant.ops.operational_state import StateStore
+    from trading_assistant.ops.state_attestation import verify_doctor_health
+    m = module()
+    store = StateStore(tmp_path)
+    # A legacy edited pass is not authenticated by a later actual failing check.
+    store.update("health", lambda _: {"schema_version": 1, "checked_at": NOW.isoformat(),
+        "checks": [{"component": "daemon", "code": "heartbeat_fresh", "status": "pass"}], "incidents": {}, "events": []})
+    observed = m.record_checks(store, [{"component": "daemon", "code": "heartbeat_stale", "status": "fail"}], NOW + timedelta(seconds=60), cipher=sensitive_cipher)
+    assert verify_doctor_health(observed, sensitive_cipher)
+    assert observed["doctor_publication"]["previous_verified"] is False
+    assert next(c for c in observed["checks"] if c["component"] == "daemon")["status"] == "fail"
+    assert next(c for c in observed["checks"] if c["component"] == "monitor")["status"] == "unknown"
+    edited = {**observed, "checks": [{"component": "daemon", "code": "heartbeat_fresh", "status": "pass"}]}
+    assert not verify_doctor_health(edited, sensitive_cipher)
+    assert not verify_doctor_health(observed, None)
+
+
+def test_doctor_publication_preserves_trusted_state_on_rollback_and_key_rotation(tmp_path, sensitive_cipher):
+    from trading_assistant.ops.operational_state import StateStore
+    from trading_assistant.ops.state_attestation import verify_doctor_health
+    from trading_assistant.security.crypto import SensitiveDataCipher
+    m = module()
+    store = StateStore(tmp_path)
+    fail = [{"component": "daemon", "code": "heartbeat_stale", "status": "fail"}]
+    m.record_checks(store, fail, NOW + timedelta(seconds=30), cipher=sensitive_cipher)
+    result = m.record_checks(store, [{"component": "daemon", "code": "heartbeat_fresh", "status": "pass"}], NOW, cipher=sensitive_cipher)
+    assert result["incidents"]["daemon"]["state"] == "open"
+    rotated = SensitiveDataCipher({"pytest-field-key-2026": b"t" * 32, "rotated-key-2026": b"r" * 32}, active_key_id="rotated-key-2026")
+    assert verify_doctor_health(result, rotated)
+    missing = SensitiveDataCipher({"rotated-key-2026": b"r" * 32}, active_key_id="rotated-key-2026")
+    assert not verify_doctor_health(result, missing)
+
+
+def test_doctor_key_failure_preserves_conservative_failure_without_attestation(tmp_path):
+    from trading_assistant.ops.operational_state import StateStore
+    from trading_assistant.ops.state_attestation import verify_doctor_health
+    class BrokenCipher:
+        def encrypt(self, *_): raise ValueError("unavailable")
+        def decrypt(self, *_): raise ValueError("unavailable")
+    m = module()
+    store = StateStore(tmp_path)
+    result = m.record_checks(store, [{"component": "daemon", "code": "heartbeat_stale", "status": "fail"}], NOW, cipher=BrokenCipher())
+    assert result["incidents"]["daemon"]["state"] == "open"
+    assert not verify_doctor_health(result, BrokenCipher())
+
+
 def test_incidents_persist_deduplicate_and_unknown_does_not_resolve(tmp_path):
     m = module()
     from trading_assistant.ops.operational_state import StateStore
