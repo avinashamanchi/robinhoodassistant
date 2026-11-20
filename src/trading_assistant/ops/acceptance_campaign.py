@@ -624,20 +624,22 @@ class CampaignCapture:
                 components = {c["component"] for c in safe_checks}
                 required = {"database", "daemon", "safety", "reconciliation", "maintenance", "jobs", "backup", "notifications", "power", "app", "release", "monitor"}
                 health_status = "fail" if "fail" in states else "pass" if required <= components and states <= {"pass"} else "unknown"
+            in_window_health = fresh and checked >= start
+            current_checks = safe_checks if in_window_health else []
             observation = {"t": at.isoformat(), "h": health_status,
-                           "m": next((c["code"] for c in safe_checks if c["component"] == "maintenance"), "unknown") if fresh else "unknown"}
+                           "m": next((c["code"] for c in current_checks if c["component"] == "maintenance"), "unknown")}
             receipts = []
-            usable_health = fresh and checked >= start and health_trusted
+            usable_health = in_window_health and health_trusted
             health_observed = checked if usable_health else at
             if not usable_health:
-                health_status = "fail" if fresh and any(c["status"] == "fail" for c in safe_checks) else "unknown"
+                health_status = "fail" if any(c["status"] == "fail" for c in current_checks) else "unknown"
             observation["h"] = health_status
-            digest = hashlib.sha256(json.dumps({"checked_at": health_observed.isoformat(), "checks": safe_checks}, sort_keys=True).encode()).hexdigest()
+            digest = hashlib.sha256(json.dumps({"checked_at": health_observed.isoformat(), "checks": current_checks}, sort_keys=True).encode()).hexdigest()
             receipts.append({"check": "runtime_health", "method": "real_local_runtime", "source": "runtime_doctor",
                              "outcome": health_status, "observed_at": health_observed.isoformat(), "captured_at": at.isoformat(), "scope": self.scope,
                              "reference": "sha256:" + digest, "observation_auth": "doctor_attested" if usable_health else "conservative_unverified",
-                             "details": [c for c in safe_checks if c["status"] != "pass"]})
-            if fresh and checked >= start:
+                             "details": [c for c in current_checks if c["status"] != "pass"]})
+            if in_window_health:
                 for check in safe_checks:
                     mapping = {("reconciliation", "reconciliation_clean", "pass"): ("broker_reconciliation", "persisted_broker_reconciliation", "daemon_reconciliation", "unknown"),
                                ("reconciliation", "reconciliation_required", "fail"): ("broker_reconciliation", "persisted_broker_reconciliation", "daemon_reconciliation", "fail"),

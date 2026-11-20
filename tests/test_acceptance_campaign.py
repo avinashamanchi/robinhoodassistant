@@ -930,3 +930,34 @@ def test_scoped_cycle_disagreement_makes_signed_capture_incomplete(session_facto
     saved = state.load("acceptance-campaign")
     assert saved["evidence_complete"] is False and saved["evidence_through"] is None
     assert report_for_store(state, at, cipher=TEST_CIPHER)["sessions"][0]["status"] == "unknown"
+
+
+@pytest.mark.parametrize("pre_start", [True, False])
+def test_doctor_failure_respects_campaign_start_even_when_unverified(tmp_path, pre_start):
+    import importlib.util
+    from pathlib import Path
+    from trading_assistant.ops.acceptance_campaign import report_for_store
+    spec = importlib.util.spec_from_file_location("runtime_operations", Path("scripts/runtime_operations.py"))
+    doctor = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(doctor)
+    class Clock:
+        def session_range(self, start, end):
+            return {"start": start.isoformat(), "end": end.isoformat(), "source": "alpaca_calendar", "sessions": []}
+    class Evidence(FakeEvidence):
+        def cycles(self): return []
+    store = StateStore(tmp_path)
+    start_campaign(store, START, SCOPE)
+    observed = START - timedelta(minutes=1) if pre_start else START + timedelta(seconds=1)
+    doctor.record_checks(store, [{"component": "daemon", "code": "heartbeat_stale", "status": "fail"}], observed, cipher=TEST_CIPHER)
+    if not pre_start:
+        store.update("health", lambda old: {**old, "doctor_publication": {}})
+    captured = START + timedelta(seconds=2)
+    CampaignCapture(store, Clock(), Evidence(), SCOPE, None, now=lambda: captured).capture()
+    report = report_for_store(store, captured, cipher=TEST_CIPHER)
+    receipt = report["latest_receipts"]["runtime_health"]
+    assert receipt["observed_at"] == captured.isoformat()
+    assert receipt["observation_auth"] == "conservative_unverified"
+    assert receipt["outcome"] == ("unknown" if pre_start else "fail")
+    assert report["checks"]["runtime_health"] == ("unknown" if pre_start else "fail")
+    if pre_start:
+        assert not any(item["status"] == "fail" for item in receipt["details"])
