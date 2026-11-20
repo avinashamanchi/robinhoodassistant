@@ -179,7 +179,9 @@ class EvidenceStore:
                 if scope is not None and isinstance(detail, dict) and not detail.get("unreadable"):
                     try:
                         day = date.fromisoformat(detail["session"])
-                        if event.target_id != detail["session"] or event.idempotency_key != cycle_key(scope["mode"], day, fingerprint):
+                        if (event.target_id != detail["session"]
+                                or event.idempotency_key != cycle_key(scope["mode"], day, fingerprint)
+                                or any(detail.get(name) != value for name, value in scope.items())):
                             overflow = True
                             continue
                     except (KeyError, TypeError, ValueError):

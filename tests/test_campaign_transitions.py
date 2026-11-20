@@ -280,3 +280,42 @@ def test_duplicate_cycle_does_not_duplicate_order_transition(session_factory):
     result = read_lifecycle(session_factory, [item, item], SCOPE, NOW, NOW + timedelta(minutes=1))
     assert result["outcome"] == "pass"
     assert len(result["orders"]) == 1
+
+
+def test_signed_capture_retains_each_order_transition_when_parent_reference_unchanged(session_factory, tmp_path, sensitive_cipher):
+    from dataclasses import replace
+    from trading_assistant.ops.acceptance_campaign import CampaignCapture, report_for_store, start_campaign
+    from trading_assistant.ops.operational_state import StateStore
+    first = make_order(session_factory)
+    with session_factory.begin() as session:
+        order = Order(idempotency_key="second-proven", ticker="MSFT", side="buy", order_type="market", qty=Decimal("1"),
+                      status="filled", broker_order_id="second-broker", acceptance_state="accepted", created_at=NOW,
+                      updated_at=NOW + timedelta(seconds=1))
+        persist_sensitive(session, order, {"approval_reason": "fixture"})
+        session.add(Fill(order_id=order.id, ticker="MSFT", side="buy", qty=Decimal("1"), price=Decimal("100"),
+                         broker_fill_id="second-fill", reconciliation_state="trusted", filled_at=NOW + timedelta(seconds=1)))
+        session.flush()
+        _persist_audit(session, actor="daemon:test", action="order.fill_reconcile", target_type="order", target_id=str(order.id),
+                       request_id="second", reason="fixture", result_code="filled", created_at=NOW + timedelta(seconds=2))
+        second = order.id
+    original = cycle(first)
+    multi = replace(original, detail={**original.detail, "orders": [{"order_id": first}, {"order_id": second}]})
+    class Clock:
+        def session_range(self, start, end):
+            return {"start": start.isoformat(), "end": end.isoformat(), "source": "alpaca_calendar", "sessions": []}
+    class Evidence(FakeEvidence):
+        def cycles(self): return [multi]
+    state = StateStore(tmp_path)
+    start_campaign(state, NOW, SCOPE, cipher=sensitive_cipher)
+    now = [NOW + timedelta(minutes=1)]
+    capture = CampaignCapture(state, Clock(), Evidence(), SCOPE, None, now=lambda: now[0], cipher=sensitive_cipher,
+        transition_reader=lambda cycles, start, at: {"lifecycle": read_lifecycle(session_factory, cycles, SCOPE, start, at)})
+    capture.capture()
+    with session_factory.begin() as session:
+        session.get(Order, first).status = "canceled"
+    now[0] += timedelta(minutes=1)
+    capture.capture()
+    history = [r for r in state.load("acceptance-campaign")["receipts"] if r["check"] == "lifecycle"]
+    assert len(history) == 2 and history[0]["reference"] == history[1]["reference"]
+    assert [[item["outcome"] for item in r["orders"]] for r in history] == [["pass", "pass"], ["unknown", "pass"]]
+    assert report_for_store(state, now[0], cipher=sensitive_cipher)["latest_receipts"]["lifecycle"]["orders"] == history[-1]["orders"]

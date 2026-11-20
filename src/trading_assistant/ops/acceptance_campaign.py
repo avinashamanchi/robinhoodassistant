@@ -598,6 +598,8 @@ class CampaignCapture:
                 health = self.store.load("health")
             except Exception:
                 health = {}
+            if not isinstance(health, dict):
+                health = {}
             # Capture only typed health evidence; preserve unknown when health is missing or stale.
             try:
                 checked = _time(health["checked_at"])
@@ -608,8 +610,11 @@ class CampaignCapture:
             from .incident_catalog import COMPONENTS
             from .state_attestation import verify_doctor_health
             health_trusted = verify_doctor_health(health, self.cipher)
-            safe_checks = [dict(c) for c in health.get("checks", []) if isinstance(c, dict)
+            raw_checks = health.get("checks")
+            raw_checks = raw_checks if isinstance(raw_checks, list) else []
+            safe_checks = [dict(c) for c in raw_checks if isinstance(c, dict)
                            and set(c) == {"component", "code", "status"}
+                           and all(isinstance(c[k], str) for k in ("component", "code", "status"))
                            and c["component"] in COMPONENTS and c["code"] in COMPONENTS[c["component"]]
                            and c["status"] in {"pass", "warn", "fail", "unknown"}]
             if not health_trusted:
@@ -622,12 +627,17 @@ class CampaignCapture:
             observation = {"t": at.isoformat(), "h": health_status,
                            "m": next((c["code"] for c in safe_checks if c["component"] == "maintenance"), "unknown") if fresh else "unknown"}
             receipts = []
+            usable_health = fresh and checked >= start and health_trusted
+            health_observed = checked if usable_health else at
+            if not usable_health:
+                health_status = "fail" if fresh and any(c["status"] == "fail" for c in safe_checks) else "unknown"
+            observation["h"] = health_status
+            digest = hashlib.sha256(json.dumps({"checked_at": health_observed.isoformat(), "checks": safe_checks}, sort_keys=True).encode()).hexdigest()
+            receipts.append({"check": "runtime_health", "method": "real_local_runtime", "source": "runtime_doctor",
+                             "outcome": health_status, "observed_at": health_observed.isoformat(), "captured_at": at.isoformat(), "scope": self.scope,
+                             "reference": "sha256:" + digest, "observation_auth": "doctor_attested" if usable_health else "conservative_unverified",
+                             "details": [c for c in safe_checks if c["status"] != "pass"]})
             if fresh and checked >= start:
-                digest = hashlib.sha256(json.dumps({"checked_at": checked.isoformat(), "checks": safe_checks}, sort_keys=True).encode()).hexdigest()
-                receipts.append({"check": "runtime_health", "method": "real_local_runtime", "source": "runtime_doctor",
-                                 "outcome": health_status, "observed_at": checked.isoformat(), "captured_at": at.isoformat(), "scope": self.scope,
-                                 "reference": "sha256:" + digest, "observation_auth": "doctor_attested" if health_trusted else "conservative_unverified",
-                                 "details": [c for c in safe_checks if c["status"] != "pass"]})
                 for check in safe_checks:
                     mapping = {("reconciliation", "reconciliation_clean", "pass"): ("broker_reconciliation", "persisted_broker_reconciliation", "daemon_reconciliation", "unknown"),
                                ("reconciliation", "reconciliation_required", "fail"): ("broker_reconciliation", "persisted_broker_reconciliation", "daemon_reconciliation", "fail"),
@@ -705,7 +715,7 @@ class CampaignCapture:
                         post_receipts = [r for r in post_receipts if r.get("check") != receipt["check"]] + [receipt]
                         continue
                     prior = next((i for i in range(len(all_receipts)-1, -1, -1) if all_receipts[i]["check"] == receipt["check"]), None)
-                    if prior is not None and all_receipts[prior]["outcome"] == receipt["outcome"] and all_receipts[prior].get("transition") == receipt.get("transition") and all_receipts[prior]["observed_at"][:10] == receipt["observed_at"][:10] and ("transition" not in receipt or all_receipts[prior]["reference"] == receipt["reference"]):
+                    if prior is not None and all_receipts[prior]["outcome"] == receipt["outcome"] and all_receipts[prior].get("transition") == receipt.get("transition") and all_receipts[prior].get("orders") == receipt.get("orders") and all_receipts[prior]["observed_at"][:10] == receipt["observed_at"][:10] and ("transition" not in receipt or all_receipts[prior]["reference"] == receipt["reference"]):
                         all_receipts.pop(prior)
                         coalesced += 1
                     all_receipts.append(receipt)

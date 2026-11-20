@@ -284,7 +284,7 @@ def test_receipt_failure_then_recovery_retains_both_transitions(tmp_path):
     current[0] += timedelta(minutes=31)
     outcome[0] = "pass"
     capture.capture()
-    assert [r["outcome"] for r in store.load("acceptance-campaign")["receipts"]] == ["fail", "pass"]
+    assert [r["outcome"] for r in store.load("acceptance-campaign")["receipts"] if r["check"] == "broker_order_reconciliation"] == ["fail", "pass"]
 
 
 def test_runtime_safety_failure_is_visible_as_a_receipt(tmp_path):
@@ -516,7 +516,7 @@ def test_cycle_window_selects_scope_key_before_loading(session_factory):
     from zoneinfo import ZoneInfo
     day = now.astimezone(ZoneInfo("America/New_York")).date()
     valid = cycle_key(SCOPE["mode"], day, evidence_fingerprint(SCOPE["config_fingerprint"], SCOPE["code_fingerprint"]))
-    store.record_cycle(key=valid, session=day, result_code="observed", detail={"marker": "scoped", "session": day.isoformat()})
+    store.record_cycle(key=valid, session=day, result_code="observed", detail={**SCOPE, "marker": "scoped", "session": day.isoformat()})
     for i in range(5):
         store.record_cycle(key=f"different-{i}", session=day, result_code="observed", detail={"marker": "other"})
     rows, overflow = store.cycles_in_window(now - timedelta(minutes=1), now + timedelta(minutes=1), limit=2, scope=SCOPE)
@@ -534,7 +534,7 @@ def test_cycle_window_rejects_encrypted_session_and_target_mismatch(session_fact
     now = datetime.now(UTC)
     day = now.astimezone(ZoneInfo("America/New_York")).date()
     key = cycle_key(SCOPE["mode"], day, evidence_fingerprint(SCOPE["config_fingerprint"], SCOPE["code_fingerprint"]))
-    store.record_cycle(key=key, session=day, result_code="observed", detail={"session": day.isoformat()})
+    store.record_cycle(key=key, session=day, result_code="observed", detail={**SCOPE, "session": day.isoformat()})
     with session_factory.begin() as session:
         event = session.scalar(select(AuditEvent).where(AuditEvent.action == "autopilot.cycle"))
         event.target_id = (day - timedelta(days=1)).isoformat()
@@ -799,7 +799,7 @@ def test_post_window_recaptures_do_not_evict_in_window_receipts(tmp_path):
     capture.capture()
     state = store.load("acceptance-campaign")
     assert state["receipts"] == original
-    assert state["post_window_receipts"][0]["check"] == "broker_order_reconciliation"
+    assert any(r["check"] == "broker_order_reconciliation" for r in state["post_window_receipts"])
 
 
 def test_pre_campaign_cycle_finishing_after_start_remains_historical(tmp_path):
@@ -853,3 +853,80 @@ def test_elapsed_calendar_session_accounting_can_finish_without_claiming_uptime(
     assert report["session_accounting_complete"] is True
     assert report["continuous_uptime"] == "unknown"
     assert report["complete"] is False
+
+
+@pytest.mark.parametrize("damage", ["missing", "unreadable", "undated", "unverified", "malformed"])
+def test_missing_current_doctor_replaces_recent_pass_with_signed_unknown(tmp_path, monkeypatch, damage):
+    import importlib.util
+    from pathlib import Path
+    from trading_assistant.ops.acceptance_campaign import report_for_store
+    spec = importlib.util.spec_from_file_location("runtime_operations", Path("scripts/runtime_operations.py"))
+    doctor = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(doctor)
+    class Clock:
+        def session_range(self, start, end):
+            return {"start": start.isoformat(), "end": end.isoformat(), "source": "alpaca_calendar", "sessions": []}
+    class Evidence(FakeEvidence):
+        def cycles(self): return []
+    checks = [{"component": component, "code": code, "status": "pass"} for component, code in {
+        "database": "database_readable", "daemon": "heartbeat_fresh", "safety": "safety_clear",
+        "reconciliation": "reconciliation_clean", "maintenance": "maintenance_idle", "jobs": "jobs_loaded",
+        "backup": "backup_recent", "notifications": "telegram_current", "power": "ac_awake",
+        "app": "app_live", "release": "release_verified"}.items()]
+    store = StateStore(tmp_path)
+    start_campaign(store, START, SCOPE)
+    doctor.record_checks(store, checks, START, cipher=TEST_CIPHER)
+    doctor.record_checks(store, checks, START + timedelta(minutes=1), cipher=TEST_CIPHER)
+    now = [START + timedelta(minutes=1, seconds=1)]
+    capture = CampaignCapture(store, Clock(), Evidence(), SCOPE, None, now=lambda: now[0])
+    capture.capture()
+    assert report_for_store(store, now[0], cipher=TEST_CIPHER)["checks"]["runtime_health"] == "pass"
+    original_load = store.load
+    if damage == "missing":
+        store.update("health", lambda _: {})
+    elif damage == "undated":
+        store.update("health", lambda old: {**old, "checked_at": "invalid"})
+    elif damage == "unverified":
+        store.update("health", lambda old: {**old, "checks": old["checks"][:-1]})
+    elif damage == "malformed":
+        store.update("health", lambda old: {**old, "checks": [{"component": [], "code": "x", "status": "pass"}]})
+    else:
+        def load(name):
+            if name == "health": raise ValueError("unreadable fixture")
+            return original_load(name)
+        monkeypatch.setattr(store, "load", load)
+    now[0] += timedelta(minutes=1)
+    capture.capture()
+    history = [r for r in original_load("acceptance-campaign")["receipts"] if r["check"] == "runtime_health"]
+    assert [r["outcome"] for r in history] == ["pass", "unknown"]
+    assert history[-1]["observed_at"] == now[0].isoformat()
+    assert report_for_store(store, now[0], cipher=TEST_CIPHER)["checks"]["runtime_health"] == "unknown"
+
+
+@pytest.mark.parametrize("field,value", [("mode", "observe"), ("config_fingerprint", "c" * 64), ("code_fingerprint", "d" * 64)])
+def test_scoped_cycle_disagreement_makes_signed_capture_incomplete(session_factory, tmp_path, field, value):
+    from sqlalchemy import select
+    from trading_assistant.autopilot.evidence import EvidenceStore, cycle_key
+    from trading_assistant.autopilot.identity import evidence_fingerprint
+    from trading_assistant.db.models import AuditEvent
+    from trading_assistant.ops.acceptance_campaign import report_for_store
+    day = date(2026, 11, 27)
+    at = datetime(2026, 11, 27, 19, tzinfo=UTC)
+    evidence = EvidenceStore(session_factory, actor="fixture")
+    key = cycle_key(SCOPE["mode"], day, evidence_fingerprint(SCOPE["config_fingerprint"], SCOPE["code_fingerprint"]))
+    detail = {**SCOPE, "session": day.isoformat(), "started_at": "2026-11-27T15:00:00+00:00", field: value}
+    evidence.record_cycle(key=key, session=day, result_code="blocked", detail=detail)
+    with session_factory.begin() as session:
+        session.scalar(select(AuditEvent).where(AuditEvent.action == "autopilot.cycle")).created_at = datetime(2026, 11, 27, 16, tzinfo=UTC)
+    class Clock:
+        def session_range(self, start, end):
+            return {"start": start.isoformat(), "end": end.isoformat(), "source": "alpaca_calendar", "sessions": [
+                {"date": day.isoformat(), "open": "2026-11-27T14:30:00+00:00", "close": "2026-11-27T18:00:00+00:00"}]}
+    rows, incomplete = evidence.cycles_in_window(START, at, scope=SCOPE)
+    assert rows == [] and incomplete is True
+    state = StateStore(tmp_path)
+    start_campaign(state, START, SCOPE)
+    CampaignCapture(state, Clock(), evidence, SCOPE, None, now=lambda: at).capture()
+    saved = state.load("acceptance-campaign")
+    assert saved["evidence_complete"] is False and saved["evidence_through"] is None
+    assert report_for_store(state, at, cipher=TEST_CIPHER)["sessions"][0]["status"] == "unknown"
