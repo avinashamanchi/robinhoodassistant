@@ -126,6 +126,10 @@ class RiskConfig(_Strict):
     max_daily_total_loss: float = Field(default=500.0, gt=0)
     max_account_drawdown_pct: float = Field(default=10.0, gt=0, le=100)
     require_broker_reconciled: bool = True
+    # Prototype guardrails (None = no limit). They never block a strictly
+    # reduce-only exit, so a cap cannot trap an open position.
+    max_open_positions: Optional[int] = Field(default=None, gt=0)
+    max_orders_per_day: Optional[int] = Field(default=None, gt=0)
 
     @field_validator("ticker_allowlist")
     @classmethod
@@ -335,22 +339,109 @@ class AnalystExtrasConfig(_Strict):
     suppress_ranging: bool = True    # v2: force NO_TRADE in RANGING regimes
 
 
-class AutopilotConfig(_Strict):
-    """Opt-in autonomous paper-trading loop (see ``trading_assistant.autopilot``).
+class AutopilotReadinessConfig(_Strict):
+    """Objective prerequisites before ``autopilot.mode: paper`` may place
+    orders (see ``trading_assistant.autopilot.readiness``).
 
-    Disabled by default. When enabled it is the only component that both decides
-    and executes without a human, but it refuses to run on anything other than
-    ``trading.mode: paper`` and every order it places still passes through the
-    deterministic risk engine, which stays the final authority.
+    Passing them is evidence that the configured rule ran as designed on
+    genuine observations; it is not evidence of profitability. Defaults are
+    deliberately conservative.
     """
 
-    enabled: bool = False
-    strategy: Literal["sma_crossover"] = "sma_crossover"
+    # Distinct market sessions with a clean observation cycle, under the
+    # current configuration and decision-code fingerprints.
+    min_observed_sessions: int = Field(default=20, gt=0)
+    # Calendar span from the first to the latest counted session, so the
+    # sessions cannot be compressed into a short burst.
+    min_observation_calendar_days: int = Field(default=28, ge=0)
+    max_degraded_sessions: int = Field(default=2, ge=0)
+    max_failed_cycles: int = Field(default=0, ge=0)
+    # The latest clean observation must be this recent.
+    max_evidence_age_hours: int = Field(default=96, gt=0)
+    # Real-data backtest evidence for the configured strategy.
+    backtest_max_age_days: int = Field(default=90, gt=0)
+    min_backtest_calendar_days: int = Field(default=730, gt=0)
+    # Release-verifier evidence for the exact running commit.
+    require_release_verification: bool = True
+    release_evidence_path: str = ".local/verification/release-results.json"
+    # Operator approval bound to the configuration and decision-code
+    # fingerprints shown by `python -m trading_assistant.autopilot readiness`.
+    # Any relevant change produces a new fingerprint and voids the approval.
+    approved_fingerprint: Optional[str] = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+
+
+class AutopilotConfig(_Strict):
+    """The daemon-hosted autopilot (see ``trading_assistant.autopilot``).
+
+    ``mode``:
+
+    * ``off``: nothing runs.
+    * ``observe``: once per market session the daemon decides and records
+      the intended actions as evidence, and places no orders.
+    * ``paper``: as observe, and places Alpaca *paper* orders only when the
+      readiness gate passes; otherwise the session is recorded as blocked
+      and nothing is placed.
+
+    Live trading is not a mode: ``trading.mode`` must be ``paper``. Every
+    order still passes the deterministic risk engine.
+    """
+
+    mode: Literal["off", "observe", "propose", "paper"] = "off"
+    # Names match ``trading_assistant.strategies`` so a backtest of the same
+    # name evaluates the exact rule the autopilot trades. ``sma_trend`` is the
+    # 20/50 + 200-day-filter rule the autopilot originally shipped with;
+    # ``sma_crossover`` is the backtester's 50/200 golden-cross rule.
+    strategy: Literal["sma_trend", "sma_crossover"] = "sma_trend"
     # Empty -> fall back to screener.universe, then risk.ticker_allowlist.
     universe: list[str] = Field(default_factory=list)
     notional_per_trade: Decimal = Field(default=Decimal("1000"), gt=0)
     max_orders_per_day: int = Field(default=8, gt=0)
-    poll_interval_seconds: int = Field(default=300, gt=0)
+    # Skip a symbol whose newest bar is older than this. Daily bars are ~3.5
+    # days old after a long weekend, so 120h tolerates holidays while refusing
+    # to decide on a cache that stopped updating.
+    max_feature_age_hours: int = Field(default=120, gt=0)
+    # The daemon runs one cycle per session, this long after the open.
+    run_after_open_minutes: int = Field(default=30, ge=0, le=360)
+    cycle_timeout_seconds: int = Field(default=120, gt=0, le=1800)
+    # Exits and re-entry spacing on top of the strategy, applied identically
+    # by the backtester (``strategies.exit_policy``). None disables the stop.
+    stop_loss_pct: Optional[float] = Field(default=None, gt=0, lt=100)
+    reentry_cooldown_days: int = Field(default=0, ge=0, le=365)
+    # After the risk engine refuses an autopilot order for a symbol and side,
+    # do not propose that same action again for this many calendar days.
+    retry_after_rejection_days: int = Field(default=3, ge=0, le=60)
+    readiness: AutopilotReadinessConfig = Field(
+        default_factory=AutopilotReadinessConfig
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_retired_keys(cls, data):
+        if isinstance(data, dict):
+            retired = sorted({"enabled", "poll_interval_seconds"} & set(data))
+            if retired:
+                raise ValueError(
+                    "autopilot."
+                    + ", autopilot.".join(retired)
+                    + " retired: the daemon hosts the autopilot; use "
+                    "autopilot.mode (off | observe | paper)"
+                )
+        return data
+
+
+class OperatorTestConfig(_Strict):
+    """Operator-generated test proposals (paper only); off unless enabled.
+
+    The symbols and the per-order notional cap are the operator's explicit
+    approval of what a test proposal may contain. Every test proposal still
+    needs a human approval and passes the full risk engine.
+    """
+
+    enabled: bool = False
+    symbols: list[str] = Field(default_factory=list)
+    max_notional_per_order: float = Field(default=50.0, gt=0)
 
 
 class AppConfig(_Strict):
@@ -371,6 +462,7 @@ class AppConfig(_Strict):
     screener: ScreenerConfig = Field(default_factory=ScreenerConfig)
     analyst: AnalystExtrasConfig = Field(default_factory=AnalystExtrasConfig)
     autopilot: AutopilotConfig = Field(default_factory=AutopilotConfig)
+    operator_test: OperatorTestConfig = Field(default_factory=OperatorTestConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
 
@@ -400,10 +492,44 @@ class AppConfig(_Strict):
 Secrets = RuntimeSecrets
 
 
-def load_config(path: str | Path = "config.yaml") -> AppConfig:
-    """Parse and validate ``config.yaml``. Raises on unknown/invalid keys (A8)."""
-    text = Path(path).read_text(encoding="utf-8")
-    raw = yaml.safe_load(text) or {}
+LOCAL_CONFIG = "config.local.yaml"
+
+
+def _merge_override(base: dict, override: dict) -> dict:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_override(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def config_sources(path: str | Path | None = None) -> list[Path]:
+    """The files ``load_config(path)`` reads, in merge order."""
+    if path is not None:
+        return [Path(path)]
+    main = Path("config.yaml")
+    local = main.with_name(LOCAL_CONFIG)
+    return [main, local] if local.is_file() else [main]
+
+
+def load_config(path: str | Path | None = None) -> AppConfig:
+    """Parse and validate ``config.yaml``. Raises on unknown/invalid keys (A8).
+
+    With no explicit path, an optional, git-ignored ``config.local.yaml``
+    beside it is merged over it: mappings merge key by key, and any other
+    value (a list included) replaces the checked-in one. This is where an
+    operator turns on machine-specific settings, such as autonomous paper
+    mode, without changing the repository's defaults. The merged result is
+    validated exactly like the checked-in file.
+    """
+    raw: dict = {}
+    for source in config_sources(path):
+        loaded = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+        if not isinstance(loaded, dict):
+            raise ValueError(f"{source.name} must contain a mapping")
+        raw = _merge_override(raw, loaded)
     return AppConfig.model_validate(raw)
 
 

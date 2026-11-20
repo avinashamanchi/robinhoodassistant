@@ -14,9 +14,10 @@ from typing import Any
 from sqlalchemy import select
 
 from ..config import load_config
-from ..db.models import Heartbeat, utcnow
+from ..db.models import Heartbeat, RuntimeTenure, utcnow
 from ..security.outbound import build_local_liveness_transport
 from ..security.secrets import RuntimeSecrets, load_role_secrets
+from .tenure import LocalProcessInspector, ProcessIdentity, ProcessProof
 
 _MAX_LIVENESS_RESPONSE_BYTES = 1024
 _LAUNCHCTL_TIMEOUT_SECONDS = 10.0
@@ -81,6 +82,10 @@ def labels_to_restart(
         labels.add("com.trading.app")
     if needs_restart(database_health, stale_seconds):
         labels.add("com.trading.daemon")
+    # A fenced, current process gets a short startup window to reconcile and
+    # publish health before a watchdog is allowed to terminate it.
+    if isinstance(database_health, dict) and database_health.get("db_ok") is True:
+        labels.difference_update(database_health.get("starting_labels", ()))
     return labels
 
 
@@ -140,10 +145,40 @@ def read_database_health(
                 .order_by(Heartbeat.at.desc(), Heartbeat.id.desc())
                 .limit(1)
             ).scalar_one_or_none()
-        age = (utcnow() - last.at).total_seconds() if last is not None else None
-        return {"db_ok": True, "heartbeat_age_seconds": age}
+            tenures = session.scalars(
+                select(RuntimeTenure).where(
+                    RuntimeTenure.role.in_(("app", "daemon")),
+                    RuntimeTenure.state == "held",
+                )
+            ).all()
+        now = utcnow()
+        age = (now - last.at).total_seconds() if last is not None else None
+        starting = []
+        inspector = LocalProcessInspector()
+        for tenure in tenures:
+            if (
+                0 <= (now - tenure.acquired_at).total_seconds() < 30
+                and tenure.expires_at > now
+                and inspector.inspect(
+                    ProcessIdentity(tenure.pid, tenure.process_start_identity)
+                ) is ProcessProof.SAME
+            ):
+                starting.append(f"com.trading.{tenure.role}")
+        return {"db_ok": True, "heartbeat_age_seconds": age, "starting_labels": starting}
     except Exception:
         return {"db_ok": False, "heartbeat_age_seconds": None}
+
+
+def launch_agent_loaded(label: str) -> bool:
+    """True when launchd has this job loaded, so kickstart can restart it."""
+    completed = subprocess.run(
+        ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=_LAUNCHCTL_TIMEOUT_SECONDS,
+        check=False,
+    )
+    return completed.returncode == 0
 
 
 def restart_launch_agent(label: str) -> None:
@@ -228,11 +263,26 @@ def main(argv: list[str] | None = None) -> int:
             ),
             stale_seconds=config.daemon.heartbeat_stale_seconds,
         )
+        # Only launchd jobs can be restarted. A daemon the operator runs in a
+        # terminal, or has not started, is not a launchd job: skip it instead
+        # of failing a kickstart every minute.
+        managed = set()
+        for component, label in _RESTART_ORDER:
+            if label not in labels:
+                continue
+            target = args.label if component == "daemon" else label
+            if launch_agent_loaded(target):
+                managed.add(label)
+            else:
+                log.info(
+                    "watchdog_restart component=%s result=not_installed",
+                    component,
+                )
         restart_failures = restart_selected_components(
-            labels,
+            managed,
             daemon_label=args.label,
         )
-        if labels or restart_failures:
+        if managed or restart_failures:
             return 1
         return 0
 

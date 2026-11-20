@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -262,3 +263,300 @@ def test_injected_alpaca_history_fake_is_not_mutated_as_a_real_sdk_client(
     )
 
     assert result["close"].iloc[-1] == 100.5
+
+
+# ── live cache expiry ───────────────────────────────────────────
+def _fake_alpaca_history(monkeypatch, closes):
+    """Install a fake SDK client that returns a new last close per download."""
+    from alpaca.data import historical as alpaca_historical
+
+    served = iter(closes)
+
+    class FakeAlpacaHistory:
+        calls = 0
+
+        def get_stock_bars(self, _request):
+            FakeAlpacaHistory.calls += 1
+            frame = pd.DataFrame(
+                {
+                    "open": [100.0],
+                    "high": [101.0],
+                    "low": [99.0],
+                    "close": [next(served)],
+                    "volume": [1_000.0],
+                },
+                index=pd.DatetimeIndex(["2026-07-24T00:00:00Z"], name="ts"),
+            )
+            return type("Bars", (), {"df": frame})()
+
+    monkeypatch.setattr(
+        backtest_data,
+        "install_pinned_session",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        alpaca_historical,
+        "StockHistoricalDataClient",
+        lambda *_args: FakeAlpacaHistory(),
+    )
+    return FakeAlpacaHistory
+
+
+def test_alpaca_cache_without_age_bound_is_reused_forever(tmp_path, monkeypatch):
+    fake = _fake_alpaca_history(monkeypatch, [100.5, 222.0])
+    path = backtest_data.cache_path(tmp_path, "AAPL", "1Day")
+
+    download_alpaca_bars("AAPL", "k", "s", cache_dir=tmp_path)
+    os.utime(path, (0, 0))  # decades old
+    again = download_alpaca_bars("AAPL", "k", "s", cache_dir=tmp_path)
+
+    assert fake.calls == 1
+    assert again["close"].iloc[-1] == 100.5
+
+
+def test_alpaca_cache_older_than_bound_is_refreshed(tmp_path, monkeypatch):
+    """A live caller must never keep deciding on bars frozen at first download."""
+    fake = _fake_alpaca_history(monkeypatch, [100.5, 222.0])
+    now = 1_000_000.0
+
+    download_alpaca_bars(
+        "AAPL", "k", "s", cache_dir=tmp_path,
+        max_cache_age_seconds=60, clock=lambda: now,
+    )
+    fresh = download_alpaca_bars(
+        "AAPL", "k", "s", cache_dir=tmp_path,
+        max_cache_age_seconds=10**9, clock=lambda: now,
+    )
+    assert fake.calls == 1
+    assert fresh["close"].iloc[-1] == 100.5
+
+    path = backtest_data.cache_path(tmp_path, "AAPL", "1Day")
+    os.utime(path, (now - 3_600, now - 3_600))
+    refreshed = download_alpaca_bars(
+        "AAPL", "k", "s", cache_dir=tmp_path,
+        max_cache_age_seconds=60, clock=lambda: now,
+    )
+
+    assert fake.calls == 2
+    assert refreshed["close"].iloc[-1] == 222.0
+    assert backtest_data.load_parquet(path)["close"].iloc[-1] == 222.0
+
+
+def test_cache_publication_leaves_no_staging_file(tmp_path):
+    frame = pd.DataFrame(
+        {"close": [1.0]},
+        index=pd.DatetimeIndex(["2026-07-24T00:00:00Z"], name="ts"),
+    )
+    target = tmp_path / "nested" / "X_1Day.parquet"
+
+    backtest_data.write_parquet_atomic(frame, target)
+
+    assert sorted(p.name for p in target.parent.iterdir()) == ["X_1Day.parquet"]
+
+
+def test_cache_publication_uses_a_unique_staging_file_per_write(
+    tmp_path, monkeypatch
+):
+    """Request threads share a PID, so a PID-named staging file would collide."""
+    staged = []
+    original = pd.DataFrame.to_parquet
+
+    def spy(self, path, *args, **kwargs):
+        staged.append(Path(path).name)
+        return original(self, path, *args, **kwargs)
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", spy)
+    frame = pd.DataFrame(
+        {"close": [1.0]},
+        index=pd.DatetimeIndex(["2026-07-24T00:00:00Z"], name="ts"),
+    )
+    target = tmp_path / "X_1Day.parquet"
+
+    backtest_data.write_parquet_atomic(frame, target)
+    backtest_data.write_parquet_atomic(frame, target)
+
+    assert len(staged) == 2
+    assert staged[0] != staged[1]
+
+
+def test_coingecko_cache_older_than_bound_is_refreshed(tmp_path):
+    closes = iter([100.5, 222.0])
+
+    def router(url, params):
+        if "/ohlc" in url:
+            return [[1672790400000, 100, 101, 99, next(closes)]]
+        return {"total_volumes": [[1672790400000, 5000]]}
+
+    now = 1_000_000.0
+    http = _HTTP(router)
+    client = CoinGeckoClient(
+        http=http,
+        cache_dir=tmp_path,
+        max_cache_age_seconds=60,
+        clock=lambda: now,
+    )
+
+    assert client.bars("BTC/USD")["close"].iloc[-1] == 100.5
+    path = backtest_data.cache_path(tmp_path, "BTC/USD", "coingecko")
+    os.utime(path, (now - 3_600, now - 3_600))
+
+    assert client.bars("BTC/USD")["close"].iloc[-1] == 222.0
+    assert http.calls == 4  # ohlc + volume per refresh
+
+
+def test_live_feature_fetches_default_to_a_bounded_cache_age(monkeypatch):
+    from trading_assistant.analyst import live_features
+
+    observed = {}
+
+    def fake_download(*_args, **kwargs):
+        observed.update(kwargs)
+        raise RuntimeError("stop after capturing arguments")
+
+    monkeypatch.setattr(backtest_data, "download_alpaca_bars", fake_download)
+    with pytest.raises(RuntimeError):
+        live_features._fetch_equity_df(
+            "AAPL",
+            SimpleNamespace(alpaca_api_key="k", alpaca_secret_key="s"),
+        )
+
+    assert observed["max_cache_age_seconds"] == (
+        live_features.LIVE_BAR_CACHE_MAX_AGE_SECONDS
+    )
+    assert live_features.LIVE_BAR_CACHE_MAX_AGE_SECONDS <= 24 * 60 * 60
+
+
+def test_screen_source_rebuilds_once_its_bars_are_too_old():
+    """The app and daemon kept one screen source for the whole process life."""
+    from trading_assistant.analyst.live_features import RefreshingScreenSource
+
+    builds = []
+    now = [0.0]
+
+    def build():
+        builds.append(len(builds))
+        version = len(builds)
+        return SimpleNamespace(
+            symbols=["AAPL"],
+            full=lambda symbol: f"{symbol}@v{version}",
+        )
+
+    source = RefreshingScreenSource(build, max_age_seconds=60, clock=lambda: now[0])
+    assert source.full("AAPL") == "AAPL@v1"
+    now[0] = 59
+    assert source.symbols == ["AAPL"] and source.full("AAPL") == "AAPL@v1"
+    now[0] = 61
+    assert source.full("AAPL") == "AAPL@v2"
+    assert len(builds) == 2
+
+
+def _counting_build(builds, *, fail_when=None, pause=None):
+    def build():
+        version = len(builds) + 1
+        builds.append(version)
+        if pause is not None:
+            pause()
+        if fail_when is not None and fail_when(version):
+            raise RuntimeError("provider unavailable")
+        return SimpleNamespace(
+            symbols=["AAPL"], full=lambda symbol: f"{symbol}@v{version}"
+        )
+
+    return build
+
+
+def test_screen_source_rebuilds_when_a_new_session_becomes_final():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from trading_assistant.analyst.live_features import RefreshingScreenSource
+
+    ny = ZoneInfo("America/New_York")
+    now = [datetime(2026, 9, 29, 19, 0, tzinfo=ny)]
+    builds = []
+    source = RefreshingScreenSource(
+        _counting_build(builds),
+        max_age_seconds=10**9,
+        clock=lambda: 0.0,
+        now=lambda: now[0],
+    )
+    assert source.full("AAPL") == "AAPL@v1"
+    now[0] = datetime(2026, 9, 29, 19, 59, tzinfo=ny)
+    assert source.full("AAPL") == "AAPL@v1"   # Sep 29 bar not final yet
+    now[0] = datetime(2026, 9, 29, 20, 1, tzinfo=ny)
+    assert source.full("AAPL") == "AAPL@v2"   # Sep 29 became final
+    assert builds == [1, 2]
+
+
+def test_screen_source_failed_rebuild_never_serves_stale_bars():
+    from trading_assistant.analyst.live_features import RefreshingScreenSource
+
+    builds = []
+    tick = [0.0]
+    source = RefreshingScreenSource(
+        _counting_build(builds, fail_when=lambda version: version == 2),
+        max_age_seconds=60,
+        clock=lambda: tick[0],
+    )
+    tick[0] = 61
+    with pytest.raises(RuntimeError):
+        source.full("AAPL")
+    # The stale v1 source was discarded; the next call rebuilds.
+    assert source.full("AAPL") == "AAPL@v3"
+
+
+def test_screen_source_concurrent_readers_trigger_one_rebuild():
+    import threading
+    import time as time_module
+
+    from trading_assistant.analyst.live_features import RefreshingScreenSource
+
+    builds = []
+    tick = [0.0]
+    source = RefreshingScreenSource(
+        _counting_build(builds, pause=lambda: time_module.sleep(0.05)),
+        max_age_seconds=60,
+        clock=lambda: tick[0],
+    )
+    tick[0] = 61
+    results = []
+    threads = [
+        threading.Thread(target=lambda: results.append(source.full("AAPL")))
+        for _ in range(8)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert builds == [1, 2]
+    assert results == ["AAPL@v2"] * 8
+
+
+def test_alpaca_cache_captured_before_a_bar_was_final_is_refreshed(
+    tmp_path, monkeypatch
+):
+    from datetime import datetime, timezone
+
+    fake = _fake_alpaca_history(monkeypatch, [100.5, 222.0])
+    path = backtest_data.cache_path(tmp_path, "AAPL", "1Day")
+    first = download_alpaca_bars("AAPL", "k", "s", cache_dir=tmp_path)
+    assert first.attrs["fetched_at"] == backtest_data.fetched_at(path)
+
+    captured = datetime(2026, 9, 29, 19, 0, tzinfo=timezone.utc)
+    os.utime(path, (captured.timestamp(), captured.timestamp()))
+    final_after = datetime(2026, 9, 30, 0, 0, tzinfo=timezone.utc)
+
+    refreshed = download_alpaca_bars(
+        "AAPL", "k", "s", cache_dir=tmp_path,
+        refresh_if_fetched_before=final_after,
+    )
+    assert fake.calls == 2
+    assert refreshed["close"].iloc[-1] == 222.0
+    assert refreshed.attrs["fetched_at"] >= final_after
+
+    reused = download_alpaca_bars(
+        "AAPL", "k", "s", cache_dir=tmp_path,
+        refresh_if_fetched_before=final_after,
+    )
+    assert fake.calls == 2
+    assert reused["close"].iloc[-1] == 222.0

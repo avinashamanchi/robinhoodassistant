@@ -11,6 +11,7 @@ import fcntl
 import hashlib
 import hmac
 import json
+import sys
 import os
 import re
 import sqlite3
@@ -525,7 +526,7 @@ def _open_matching_artifact(
 
 
 @contextmanager
-def _locked_artifact_state(path: Path):
+def _locked_artifact_state(path: Path, *, max_artifact_bytes: int | None = None):
     state_path = _commit_state_path(path)
     with _locked_state_descriptor(state_path) as (
         state_descriptor,
@@ -536,6 +537,8 @@ def _locked_artifact_state(path: Path):
             state_stat,
             state_path,
         )
+        if max_artifact_bytes is not None and (type(max_artifact_bytes) is not int or max_artifact_bytes <= 0 or state.artifact_size > max_artifact_bytes):
+            raise EncryptedBackupError("encrypted_backup_size_exceeds_inspection_bound")
         artifact_descriptor = _open_matching_artifact(path, state)
         try:
             yield state, state_descriptor, artifact_descriptor
@@ -595,11 +598,11 @@ def _is_committed_artifact(path: Path) -> bool:
 
 
 @contextmanager
-def _open_committed_artifact(path: Path):
+def _open_committed_artifact(path: Path, *, max_artifact_bytes: int | None = None):
     if _COMMITTED_NAME.fullmatch(path.name) is None:
         raise EncryptedBackupError("encrypted_backup_not_committed")
     try:
-        with _locked_artifact_state(path) as (
+        with _locked_artifact_state(path, max_artifact_bytes=max_artifact_bytes) as (
             state,
             _state_descriptor,
             artifact_descriptor,
@@ -951,11 +954,11 @@ def _parse_header_stream(handle) -> tuple[dict[str, object], bytes, bytes]:
     return header, nonce, aad
 
 
-def read_encrypted_backup_header(path: str | Path) -> dict[str, object]:
+def read_encrypted_backup_header(path: str | Path, *, max_artifact_bytes: int | None = None) -> dict[str, object]:
     """Return only canonical non-secret metadata from an encrypted artifact."""
     artifact = Path(path)
     try:
-        with _open_committed_artifact(artifact) as handle:
+        with _open_committed_artifact(artifact, max_artifact_bytes=max_artifact_bytes) as handle:
             header, _nonce, _aad = _parse_header_stream(handle)
         return header
     except EncryptedBackupError:
@@ -1857,15 +1860,40 @@ def main(
     secrets_loader=load_role_secrets,
     process_identity: ProcessIdentity | None = None,
     process_inspector: ProcessInspector | None = None,
+    database_guard=None,
 ) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--destination")
     parser.add_argument("--retention-days", type=int, default=14)
+    parser.add_argument(
+        "--database",
+        help=(
+            "back up this SQLite file explicitly (for example a database you "
+            "have not chosen yet); default: the chosen runtime database"
+        ),
+    )
     args = parser.parse_args(argv)
+    from ..installation import InstallationError, require_chosen_database
     from ..logging import runtime_startup
+    from ..security.secrets import secret_value
+    from ..startup_help import remedy
 
     config = config_loader()
     secrets = secrets_loader("backup", config=config)
+    if args.database is not None:
+        source = Path(args.database).resolve(strict=True)
+    else:
+        try:
+            source = (database_guard or require_chosen_database)(
+                secret_value(secrets.database_url)
+            )
+        except InstallationError as error:
+            print(
+                f"backup refused: {error.code}. Next: {remedy(error.code)} "
+                "(or name a file with --database)",
+                file=sys.stderr,
+            )
+            return 1
     inspector = process_inspector or LocalProcessInspector()
     identity = process_identity or inspector.current()
     key_buffer = validate_base64_key(
@@ -1875,7 +1903,7 @@ def main(
     try:
         with runtime_startup("backup", secrets):
             receipt = backup_database(
-                database_path(secrets.database_url),
+                source,
                 (
                     args.destination
                     if args.destination is not None

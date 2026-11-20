@@ -56,6 +56,10 @@ class LLMResponse:
     model: str = ""
 
 
+class ProviderRequestRejected(RuntimeError):
+    """A provider returned a completed error response with no billable output."""
+
+
 class BudgetedLLMBackend:
     """Reserve and settle durable provider budget around one raw attempt."""
 
@@ -149,6 +153,21 @@ class BudgetedLLMBackend:
                 tool_choice=tool_choice,
                 request_id=request_id,
             )
+        except ProviderRequestRejected:
+            try:
+                # Keep the attempted call charged, but the confirmed HTTP error
+                # has no generated token usage to leave unresolved.
+                self.budgets.settle(
+                    reservation.reservation_id,
+                    input_tokens=0,
+                    output_tokens=0,
+                )
+            except BaseException as settlement_error:
+                self._reconcile_unknown_after_failure(
+                    reservation.reservation_id, settlement_error
+                )
+                raise
+            raise
         except BaseException as delegate_error:
             self._reconcile_unknown_after_failure(
                 reservation.reservation_id,

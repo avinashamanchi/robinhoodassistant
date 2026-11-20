@@ -30,7 +30,7 @@ DEFAULT_OUTPUT_RELATIVE = Path(".local/verification")
 NETWORK_GUARD_PATH = Path(__file__).resolve().with_name(
     "verifier_network_guard.py"
 )
-EXPECTED_MIGRATION_HEAD = "20260729_0017"
+EXPECTED_MIGRATION_HEAD = "20260730_0018"
 TRUSTED_ANCESTRY_ANCHOR = "4807cc0dc9dd20f21cf174e81034fea656162e3d"
 CI_VERIFIER_BIN = Path("/opt/trading-assistant-verifier/bin")
 _MAX_CAPTURE_CHARS = 32_768
@@ -158,17 +158,17 @@ class TestManifest:
 
 
 _MIGRATION_TEST_MANIFEST = TestManifest(
-    count=182,
+    count=186,
     digest=(
-        "sha256:8b7fc05ee92e1ad2a257e8967cdba00f"
-        "5948795a5ea98ac61aeeed3a9b09e8ce"
+        "sha256:8a6d2f8130bf2dbc7677972a30668603"
+        "64f23e388a104056fde74a60035c46ff"
     ),
 )
 _SECURITY_TEST_MANIFEST = TestManifest(
-    count=660,
+    count=904,
     digest=(
-        "sha256:7b45fe87f34aa26180c48a7bde37fb90"
-        "56d95b6854d988cbf7aea34fedbd91a8"
+        "sha256:6090766731f1d7c3f00a1d05bd0e3514"
+        "90aa8ddf7ef92384c2459e0d846ac93d"
     ),
 )
 _SAFETY_TEST_MANIFEST = TestManifest(
@@ -186,10 +186,10 @@ _FRONTEND_TEST_MANIFEST = TestManifest(
     ),
 )
 _FULL_TEST_MANIFEST = TestManifest(
-    count=4253,
+    count=5384,
     digest=(
-        "sha256:b438bc6183eb6c7c3a7f208d5c992a82"
-        "6549fcf0cafd0c06d8526281e294992d"
+        "sha256:d6ff4bb70bcea6a47d894f27c78016b90"
+        "f0b5c8b8f7053b401a84e1bff96a15d"
     ),
 )
 
@@ -1762,6 +1762,17 @@ class ReleaseVerifier:
                     "tests/test_untrusted_content.py",
                     "tests/test_candidate_boundary.py",
                     "tests/test_security_posture.py",
+                    "tests/test_release_evidence.py",
+                    "tests/test_release_actions_client.py",
+                    "tests/test_release_operator_boundary.py",
+                    "tests/test_operational_state.py",
+                    "tests/test_power_guard.py",
+                    "tests/test_runtime_operations.py",
+                    "tests/test_runtime_alerts.py",
+                    "tests/test_launchd_installer.py",
+                    "tests/test_forward_evaluation.py",
+                    "tests/test_acceptance_campaign.py",
+                    "tests/test_campaign_transitions.py",
                     "-v",
                 ),
                 timeout_seconds=1200.0,
@@ -1838,7 +1849,8 @@ class ReleaseVerifier:
                     "--cov-branch",
                     "--cov-fail-under=90",
                 ),
-                timeout_seconds=1800.0,
+                # Instrumenting the full suite can take over 30 minutes on CI.
+                timeout_seconds=2700.0,
                 expects_tests=True,
                 test_manifest=_FULL_TEST_MANIFEST,
             ),

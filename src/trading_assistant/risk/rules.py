@@ -68,6 +68,44 @@ def check_max_notional(
     return None
 
 
+def check_max_open_positions(
+    order: OrderRequest, snapshot: PortfolioSnapshot, config: RiskConfig
+) -> Optional[str]:
+    limit = config.max_open_positions
+    if limit is None or order.side is not OrderSide.BUY:
+        return None
+    symbol = order.ticker.upper()
+    open_symbols = {
+        ticker
+        for ticker, position in snapshot.positions.items()
+        if position.qty != 0
+    } | {
+        ticker
+        for ticker, notional in snapshot.pending_buy_notional_by_ticker.items()
+        if notional > 0
+    }
+    if symbol in open_symbols or len(open_symbols) < limit:
+        return None
+    return (
+        f"opening {symbol} would exceed max {limit} open positions "
+        f"({len(open_symbols)} open or pending)"
+    )
+
+
+def check_daily_order_count(
+    snapshot: PortfolioSnapshot, config: RiskConfig
+) -> Optional[str]:
+    limit = config.max_orders_per_day
+    if limit is None:
+        return None
+    count = snapshot.orders_submitted_today
+    if count is None:
+        return "today's order count is unknown; new orders are blocked"
+    if count >= limit:
+        return f"{count} orders submitted this session; max {limit} per day"
+    return None
+
+
 def check_max_position(
     order: OrderRequest, snapshot: PortfolioSnapshot, config: RiskConfig
 ) -> Optional[str]:

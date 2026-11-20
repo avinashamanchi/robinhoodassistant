@@ -18,6 +18,7 @@ from trading_assistant.llm.base import (
     LLMResponse,
     TextBlock,
     Usage,
+    ProviderRequestRejected,
 )
 from trading_assistant.llm.budget import (
     BudgetLimits,
@@ -136,6 +137,110 @@ def _backend(
 def _reservation_state(session_factory, reservation_id: str) -> str:
     with session_factory() as session:
         return session.get(ProviderReservation, reservation_id).state
+
+
+def test_confirmed_provider_rejection_keeps_attempt_but_does_not_latch_usage(session_factory):
+    backend, delegate, service = _backend(
+        session_factory, ProviderRequestRejected("rejected")
+    )
+    with pytest.raises(ProviderRequestRejected):
+        backend.create(**PAYLOAD, request_id="confirmed-rejected")
+    status = service.status("test", now=NOW + timedelta(minutes=10))
+    assert (status.calls_used, status.input_tokens_used, status.output_tokens_used) == (1, 0, 0)
+    assert status.reconciliation_required is False
+    assert len(delegate.calls) == 1
+
+
+def test_confirmed_rejection_recovery_is_audited_and_preserves_other_unknown_calls(session_factory):
+    service = _service(session_factory)
+    reservations = []
+    for index in range(2):
+        reservation = service.reserve(
+            provider="gemini", category="analysis", request_id=f"recovery-{index}",
+            input_tokens=20, output_tokens=30, now=NOW,
+        )
+        service.mark_started(reservation.reservation_id, now=NOW)
+        service.mark_unknown(reservation.reservation_id, now=NOW + timedelta(seconds=1))
+        reservations.append(reservation)
+    later = NOW + timedelta(minutes=10)
+    service.reconcile_expired_started(later)
+    for index, reservation in enumerate(reservations):
+        options = dict(
+            status_code=503, actor="operator:test",
+            reason="verified Gemini HTTP 503 response",
+            request_id=f"recover-{index}", now=later,
+        )
+        service.reconcile_failed_request(reservation.reservation_id, **options)
+        service.reconcile_failed_request(reservation.reservation_id, **options)
+        status = service.status("gemini", now=later)
+        assert status.calls_used == 2
+        assert status.reconciliation_required is (index == 0)
+        assert status.input_tokens_used == (20 if index == 0 else 0)
+    from trading_assistant.db.models import AuditEvent
+    with session_factory() as session:
+        events = session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.action == "provider_budget.reconcile_failure"
+            )
+        ).all()
+        assert len(events) == 2
+
+
+def test_rejection_recovery_refuses_calls_that_may_still_be_running(session_factory):
+    service = _service(session_factory)
+    reservation = service.reserve(
+        provider="gemini", category="analysis", request_id="still-running",
+        input_tokens=20, output_tokens=30, now=NOW,
+    )
+    service.mark_started(reservation.reservation_id, now=NOW)
+    service.mark_unknown(reservation.reservation_id, now=NOW)
+    with pytest.raises(ProviderBudgetUnavailable, match="expired unknown"):
+        service.reconcile_failed_request(
+            reservation.reservation_id, status_code=503, actor="operator:test",
+            reason="review", request_id="too-early", now=NOW,
+        )
+    assert _reservation_state(session_factory, reservation.reservation_id) == "unknown"
+
+
+def test_unknown_usage_recovery_keeps_the_full_reserved_charge(session_factory):
+    service = _service(session_factory)
+    reservation = service.reserve(
+        provider="gemini", category="analysis", request_id="unknown-charge",
+        input_tokens=20, output_tokens=30, now=NOW,
+    )
+    service.mark_started(reservation.reservation_id, now=NOW)
+    service.mark_unknown(reservation.reservation_id, now=NOW)
+    later = NOW + timedelta(minutes=10)
+    service.reconcile_failed_request(
+        reservation.reservation_id, status_code=None, actor="operator:test",
+        reason="charge reserved upper bounds", request_id="charge-cap", now=later,
+    )
+    status = service.status("gemini", now=later)
+    assert (status.calls_used, status.input_tokens_used, status.output_tokens_used) == (1, 20, 30)
+    assert status.reconciliation_required is False
+
+
+def test_recovery_audit_failure_rolls_back_usage_and_reservation(session_factory, monkeypatch):
+    service = _service(session_factory)
+    reservation = service.reserve(
+        provider="gemini", category="analysis", request_id="audit-rollback",
+        input_tokens=20, output_tokens=30, now=NOW,
+    )
+    service.mark_started(reservation.reservation_id, now=NOW)
+    service.mark_unknown(reservation.reservation_id, now=NOW)
+
+    def fail_audit(*args, **kwargs):
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setattr("trading_assistant.security.sensitive_fields.persist_sensitive", fail_audit)
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        service.reconcile_failed_request(
+            reservation.reservation_id, status_code=503, actor="operator:test",
+            reason="confirmed rejection", request_id="failed-audit",
+            now=NOW + timedelta(minutes=10),
+        )
+    assert _reservation_state(session_factory, reservation.reservation_id) == "unknown"
+    assert service.inspect("gemini", now=NOW + timedelta(minutes=10)).input_tokens_used == 20
 
 
 @pytest.mark.parametrize("provider", ["anthropic", "gemini", "groq"])

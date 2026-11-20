@@ -543,6 +543,117 @@ class ProviderBudgetService:
             )
             session.commit()
 
+    def reconcile_failed_request(
+        self,
+        reservation_id: str,
+        *,
+        status_code: int | None,
+        actor: str,
+        reason: str,
+        request_id: str,
+        now: datetime | None = None,
+    ) -> None:
+        """Record operator-reviewed accounting of a failed Gemini attempt.
+
+        This is an explicit recovery operation for an expired unknown call.
+        Its attempted call remains charged and its evidence is audited in the
+        same transaction. Without a confirmed HTTP status, charge the complete
+        reservation as a conservative budget estimate. Other ambiguous calls
+        and usage overruns stay latched.
+        """
+        from ..db.models import AuditEvent
+        from ..security.sensitive_fields import persist_sensitive
+
+        _require_text("reservation_id", reservation_id)
+        _require_text("actor", actor)
+        _require_text("reason", reason)
+        request_id = canonical_request_id(request_id)
+        if status_code is not None and (
+            type(status_code) is not int or not 400 <= status_code < 600
+        ):
+            raise ValueError("confirmed provider error status required")
+        current = _as_utc(now or self._clock())
+        with _budget_store_session(self._session_factory) as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            row = session.get(ProviderReservation, reservation_id)
+            if row is None or row.provider != "gemini":
+                raise ProviderBudgetUnavailable("Gemini reservation unavailable")
+            self._validate_provider_aggregates(session, row.provider)
+            input_charge = row.input_reserved if status_code is None else 0
+            output_charge = row.output_reserved if status_code is None else 0
+            if (
+                row.state == "settled"
+                and row.input_actual == input_charge
+                and row.output_actual == output_charge
+            ):
+                return
+            if row.state != "unknown" or _as_utc(row.expires_at) > current:
+                raise ProviderBudgetUnavailable("expired unknown reservation required")
+            day = session.get(ProviderBudgetDay, (row.provider, row.budget_day))
+            day.input_tokens_used += input_charge - row.input_reserved
+            day.output_tokens_used += output_charge - row.output_reserved
+            row.input_actual = input_charge
+            row.output_actual = output_charge
+            row.state = "settled"
+            row.settled_at = current
+            session.flush()
+            others = session.scalars(
+                select(ProviderReservation).where(
+                    ProviderReservation.provider == row.provider,
+                    ProviderReservation.budget_day == row.budget_day,
+                )
+            ).all()
+            overrun = any(
+                reservation.state == "settled"
+                and (
+                    reservation.input_actual > reservation.input_reserved
+                    or reservation.output_actual > reservation.output_reserved
+                )
+                for reservation in others
+            )
+            ambiguous = any(
+                reservation.state in {"started", "unknown"}
+                and _as_utc(reservation.expires_at) <= current
+                for reservation in others
+            )
+            day.reconciliation_required = overrun or ambiguous
+            day.reconciliation_code = ""
+            if overrun:
+                day.reconciliation_code = _USAGE_OVERRUN_CODE
+            elif ambiguous:
+                day.reconciliation_code = _STALE_STARTED_CODE
+            day.updated_at = current
+            persist_sensitive(
+                session,
+                AuditEvent(
+                    actor=actor,
+                    action="provider_budget.reconcile_failure",
+                    target_type="provider_reservation",
+                    target_id=reservation_id,
+                    request_id=request_id,
+                    result_code=(
+                        "charged_reserved_limit"
+                        if status_code is None else "confirmed_rejected"
+                    ),
+                ),
+                {
+                    "reason": reason,
+                    "detail_json": json.dumps({
+                        "provider": row.provider,
+                        "status_code": status_code,
+                        "request_id": row.request_id,
+                        "accounting": (
+                            "reserved_upper_bound"
+                            if status_code is None else "confirmed_unbilled_error"
+                        ),
+                    }),
+                },
+                session_factory=self._session_factory,
+            )
+            session.flush()
+            self._validate_provider_aggregates(session, row.provider)
+            session.commit()
+
     def release_expired_unstarted(self, now: datetime) -> int:
         current = _as_utc(now)
         with _budget_store_session(self._session_factory) as session:
