@@ -449,6 +449,8 @@ def test_release_verifier_has_only_the_exact_offline_commands():
                 "tests/test_runtime_alerts.py",
                 "tests/test_launchd_installer.py",
                 "tests/test_forward_evaluation.py",
+                "tests/test_acceptance_campaign.py",
+                "tests/test_campaign_transitions.py",
                 "-v",
             ),
         ),

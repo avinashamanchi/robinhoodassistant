@@ -5,8 +5,9 @@ Spec: `docs/superpowers/specs/2026-11-15-operational-improvements-design.md`
 Execute sequentially in the current designated feature checkout. Preserve the
 paper-only and risk/approval boundaries. Do not move the production database or
 install a second broker runtime. The user has authorized the six milestones;
-the user selected the existing Mac on power; notification destinations remain
-an unresolved input.
+the user selected the existing Mac with AC-powered unattended operation and
+Telegram incident alerts. Current power and delivery evidence must be observed,
+not inferred from those choices.
 
 ## Task 1: verification handoff
 
@@ -61,6 +62,35 @@ versioned, scoped check receipts and session expectations; distinguish simulated
 checks from broker reads/mutations. Test missed/duplicate/weekend sessions and
 restarts. Run authorized checks through existing paper-only service boundaries.
 Expected: real current baseline and an accurately incomplete month-long campaign.
+
+## Task 4b: partial-fill reconciliation convergence
+
+Corrective work discovered during the real Task 4 baseline, before Task 5.
+The November 17 natural paper cycle exposed a non-atomic broker-read sequence:
+exact activities were fetched, then newer cumulative order quantities were read.
+The mismatch tripped broker drift and the daemon stop; later reconciliation
+converged. Preserve that real incident and all order/fill history.
+
+Investigate and reproduce this sequence with a deterministic fake broker before
+changing implementation. Trace order/status/activity/position read ordering,
+cursor overlap, submission-barrier ownership and daemon restart behavior. Fix
+only a demonstrated feed-convergence defect with bounded fresh read-only broker
+evidence. A coherent exact activity ledger is required before success. Never
+infer missing fills from averages, tolerate unexplained quantities, automatically
+clear an existing breaker, or weaken identity, overfill, chronology, precision,
+unknown-order and cancellation checks. A persistent mismatch must still block
+and trip as appropriate. Keep retries within explicit call/time bounds and
+existing transport deadlines; do not retry order submission or cancellation.
+
+Test advancing partial fills between reads, eventually consistent exact feeds,
+persistent disagreement, invalid/mutated activity, contradictory cumulative
+values, deduplication/restarts and unchanged fail-closed execution snapshots.
+Preserve existing transaction-local audit and lifecycle proofs. No real provider
+or broker calls, credentials, new trades, cancellations, resets, strategy/risk
+changes, second runtime or push by the implementer. Controller handles actual
+read-only acceptance and guarded recovery after current release evidence passes.
+Commit only corrective task files; controller owns release manifests/progress.
+Use focused RED/GREEN tests and report any unresolved source limitation honestly.
 
 ## Task 5: research reliability
 

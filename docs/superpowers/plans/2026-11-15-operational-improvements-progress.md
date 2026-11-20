@@ -17,7 +17,10 @@ confirmed no charger is currently available and authorized continuing on battery
 (then approximately 98%). Temporary battery awake mode will expire after two
 hours or release at 30% battery; normal unattended mode remains AC-powered.
 User selected Telegram and authorized use/configuration of their bot. Managed
-connection `trading-alerts` is pending; no token or recipient has been assumed.
+connection `trading-alerts` was paired and its actual setup alert verified on
+November 17. Power state is observed continuously: the resumed November 17
+baseline reports battery power and an expired awake grant; earlier AC verification
+does not establish current continuous uptime.
 
 - Task 1: complete — commit `22f9fe508ca7de4a73089f68516b753f7e5e0a2c`.
   CI run `43924181965` passed all jobs; its actual canonical artifact was
@@ -83,7 +86,11 @@ connection `trading-alerts` is pending; no token or recipient has been assumed.
     unconfirmed tests, stale delivery jobs and uncertain sends explicitly.
   - Full/security collections at this milestone: 5,271/791 tests. Future changes
     require fresh current-commit release evidence before acceptance.
-- Task 3: implementation/review complete; release acceptance in progress —
+- Task 3: complete — release candidate `88397c71245bbace75a219ab651845a3b65a7a3d`;
+  CI `44046754916` passed all jobs and its canonical artifact was published.
+  Daemon readiness accepted the current report and was READY.
+  Full suite: 5,290 passed, one credentialed skip.
+  Implementation
   task commits `92bcee0`, `1f9c64b`, `f741a2c`.
   - Added reusable Decimal forward evaluation, explicit capital/currency, dated
     benchmark matching, raw/Modified Dietz calculations, independent dollar/percent
@@ -105,9 +112,41 @@ connection `trading-alerts` is pending; no token or recipient has been assumed.
   - Genuine private report was generated with mode0600, seven trusted fills and
     no closed trades. All 191 legacy snapshots lack the new required identity or
     original timing evidence and are counted as excluded, not relabelled as verified.
-    New-schema runtime observation and exact-commit CI acceptance remain pending.
+    New-schema runtime observation produced two usable USD snapshots and one
+    genuinely captured provisional activity interval. Exact-commit CI/artifact
+    handoff was accepted; the isolated local mock safety drill also passed.
     Report observation: `.local/improvements/task3-reviewed-report-observation.json`.
   - Collection manifests at this candidate: 5,291 full / 811 security tests.
-- Task 4: pending (month-long observation necessarily ongoing after tooling ships).
+- Task 4: implementation and independent source review complete at `92e8756`;
+  current release and genuine baseline acceptance are recorded separately in
+  `.local/improvements/task4-acceptance.json` when verified. The daemon-owned
+  campaign observes exchange calendars, expected sessions and bounded typed
+  receipts. Thirty future calendar days remain an ongoing observation requirement.
+  - Review corrections prevent stale scans from certifying missed sessions or a
+    whole month, preserve window boundaries and independent order transitions,
+    reject contradictory cycle scope, and make missing current evidence unknown.
+    Campaign state and fresh doctor publications have authenticated provenance.
+    Broker observations use encrypted producer metadata; backup inspection reads
+    bounded committed artifacts directly. Controlled restart proof stays pending
+    until a supported before/after source exists.
+  - The covering integration suite passed 536 tests; subsequent focused fixes
+    passed 87 tests. Independent scoped review closed all Important findings.
+    Controller verifier/boundary checks passed 69 tests. Full/security collections
+    are pinned to 5,384/904; actual complete CI remains an acceptance requirement.
+  - Daemon, watchdog and doctor were placed in recorded development maintenance
+    during source changes. Release acceptance requires restoring all eight jobs,
+    observing fresh verified publications, and preserving the existing unsigned
+    campaign as historical material before starting a fresh verified period.
+  - The resumed real baseline has fresh local health and successful broker-sync
+    receipts, but paper trading remains stopped by `broker_drift` and
+    `operator_global`. Today's natural partial fills advanced between separate
+    activity/status reads. An isolated fake-broker regression reproduces the
+    non-atomic snapshot comparison. Corrective Task 4b remains the next
+    implementation step; its worker reported a usage-limit reset of November 24
+    at 3:08 PM. The already-reviewed campaign may be released to restore monitoring
+    while both trading latches remain active. Existing fill history remains intact.
+  - Telegram is paired, with 34 confirmed deliveries and one uncertain attempt at
+    the current observation. An uncertain send is retained and is not retried
+    automatically.
 - Task 5: pending.
 - Task 6: pending.
