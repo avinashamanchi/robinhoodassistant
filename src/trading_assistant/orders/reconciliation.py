@@ -1039,17 +1039,21 @@ class ReconciliationService:
                         continue
                     if (
                         refresh is not None
-                        and order.id not in refresh.observed_orders
                         and (
                             duplicate is None
                             or not fill_has_trusted_identity(duplicate)
                         )
                     ):
-                        self._latch_order_in_session(order, "unverified_fill_status")
-                        blocked_order_ids.add(order.id)
-                        drift.append(
-                            f"fresh fill for order {order.id} requires a broker status"
-                        )
+                        # The execution and its gate must survive as one commit.
+                        # Each observed order releases its own latch after comparison.
+                        if order.id in refresh.observed_orders:
+                            self._latch_order_in_session(order, order.last_error_code)
+                        else:
+                            self._latch_order_in_session(order, "unverified_fill_status")
+                            blocked_order_ids.add(order.id)
+                            drift.append(
+                                f"fresh fill for order {order.id} requires a broker status"
+                            )
                     if duplicate is not None:
                         if not fill_has_trusted_identity(duplicate):
                             self._replace_with_authoritative_activity(
@@ -1115,10 +1119,14 @@ class ReconciliationService:
                     ):
                         blocked_order_ids.add(order.id)
 
-                if advance_cursor:
+                # A repair query can start later than the account cursor. Only
+                # an ordinary scan covers that interval. Its newest execution
+                # may be a duplicate already persisted by the repair.
+                if advance_cursor and refresh is None:
                     cursor_candidate = None
-                    if after is None:
-                        cursor_candidate = batch[-1]
+                    latest = batch[-1]
+                    if after is None or _normalized_utc(latest.filled_at) > after:
+                        cursor_candidate = latest
                     else:
                         at_or_after_cursor = [
                             activity

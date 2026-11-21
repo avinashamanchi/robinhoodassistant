@@ -11,9 +11,10 @@ from sqlalchemy import select
 from tests.test_reconciliation_service import (
     ActivityBroker,
     _mutation,
+    _persist_order,
     _submitted_order_id,
 )
-from trading_assistant.broker.models import BrokerFill, OrderStatus
+from trading_assistant.broker.models import BrokerFill, OrderResult, OrderStatus
 from trading_assistant.db.lifecycle_proofs import lifecycle_proof_matches
 from trading_assistant.db.models import (
     AuditEvent,
@@ -32,13 +33,14 @@ class BetweenReadsBroker(ActivityBroker):
     def __init__(self):
         super().__init__()
         self.pending = None
+        self.advancing_order = None
         self.later_activities = []
         self.reads = []
         self.refresh_error = False
 
     def get_order_status(self, order_id):
         remote = super().get_order_status(order_id)
-        if self.pending is not None:
+        if self.pending is not None and order_id == self.advancing_order:
             self.reads.append("status")
             remote = replace(
                 remote,
@@ -71,6 +73,7 @@ def crossing(make_service):
     order_id = _submitted_order_id(service)
     with service.session_factory() as session:
         broker_id = session.get(Order, order_id).broker_order_id
+    broker.advancing_order = broker_id
     now = utcnow()
     first = BrokerFill(
         broker_fill_id="first-visible",
@@ -295,8 +298,6 @@ def test_sdk_rate_limit_cannot_retry_supplemental_read():
 
 
 def test_fresh_activity_on_previously_terminal_order_requires_its_own_status(crossing):
-    from tests.test_reconciliation_service import _persist_order
-
     broker, service, _, _, late = crossing
     with service.session_factory.begin() as session:
         other = _persist_order(
@@ -391,3 +392,167 @@ def test_refresh_from_generic_exact_reader_respects_page_budget(crossing):
         assert (
             session.get(Order, order_id).acceptance_state == "fill_reconcile_required"
         )
+
+
+def _second_partial_order(service, broker, submitted_at):
+    remote = OrderResult(
+        "second-client",
+        "second-broker",
+        OrderStatus.PARTIALLY_FILLED,
+        filled_qty=Decimal(".3"),
+    )
+    with service.session_factory.begin() as session:
+        order = _persist_order(
+            session,
+            Order(
+                idempotency_key=remote.idempotency_key,
+                broker_order_id=remote.broker_order_id,
+                ticker="AAPL",
+                side="buy",
+                order_type="market",
+                qty=Decimal(1),
+                submission_started_at=submitted_at,
+                created_at=submitted_at,
+                status="partially_filled",
+                acceptance_state="accepted",
+            ),
+        )
+        session.flush()
+        order_id = order.id
+    broker._orders_by_id[remote.broker_order_id] = remote
+    broker._orders_by_key[remote.idempotency_key] = remote
+    return order_id, remote
+
+
+@pytest.mark.parametrize("foreign", [False, True], ids=["known-order", "foreign-order"])
+def test_ordinary_scan_retains_coverage_before_lagging_orders_submission(
+    crossing, make_service, foreign
+):
+    broker, service, _, _, template = crossing
+    earlier = template.filled_at - timedelta(minutes=60)
+    _, other = _second_partial_order(service, broker, earlier)
+    old_fill = replace(
+        template,
+        broker_order_id=other.broker_order_id,
+        broker_fill_id="ordinary-boundary",
+        qty=Decimal(".3"),
+        filled_at=earlier + timedelta(minutes=1),
+    )
+    broker.pending = None
+    broker.activities = [old_fill]
+    baseline = service.reconciliation.reconcile(**_mutation("seed ordinary cursor"))
+    assert (baseline.inserted_fills, baseline.broker_drift) == (1, ())
+
+    late = replace(
+        template,
+        broker_order_id="foreign-broker" if foreign else other.broker_order_id,
+        broker_fill_id="visible-in-skipped-interval",
+        filled_at=earlier + timedelta(minutes=45),
+    )
+    repair = replace(template, broker_fill_id="refresh-only", qty=Decimal(".5"))
+    broker.later_activities = [old_fill, late, repair]
+    broker.pending = Decimal(".5")
+    result = _sync(service)
+    assert result["broker_drift"] == []
+    assert result["inserted_fills"] == 1
+
+    if not foreign:
+        updated = replace(other, filled_qty=Decimal(".5"))
+        broker._orders_by_id[other.broker_order_id] = updated
+        broker._orders_by_key[other.idempotency_key] = updated
+    restarted = make_service(broker=broker)
+    previous_reads = len(broker.activity_calls)
+    checked = restarted.reconciliation.reconcile(
+        **_mutation("ordinary replay after refresh")
+    )
+    with restarted.session_factory() as session:
+        cursor = session.scalars(select(ReconciliationCursor)).one()
+        known = set(session.scalars(select(Fill.broker_fill_id)))
+        if foreign:
+            assert any("foreign-broker" in item for item in checked.broker_drift)
+            assert restarted.breakers.is_tripped(BreakerScope.broker_drift())
+            assert cursor.last_activity_id == old_fill.broker_fill_id
+            assert late.broker_fill_id not in known
+        else:
+            assert (checked.broker_drift, checked.inserted_fills) == ((), 1)
+            assert late.broker_fill_id in known
+            # The newest item is a duplicate first ingested by the refresh.
+            assert cursor.last_activity_id == repair.broker_fill_id
+            cursor_version = cursor.version
+    assert broker.activity_calls[previous_reads:] == [old_fill.filled_at]
+    if not foreign:
+        repeat = restarted.reconciliation.reconcile(
+            **_mutation("repeat ordinary replay")
+        )
+        assert (repeat.broker_drift, repeat.inserted_fills) == ((), 0)
+        with restarted.session_factory() as session:
+            assert (
+                session.scalars(select(ReconciliationCursor)).one().version
+                == cursor_version
+            )
+
+
+def test_interruption_after_first_status_commit_keeps_second_contradiction_latched(
+    crossing, make_service, monkeypatch
+):
+    from trading_assistant.orders import reconciliation
+
+    broker, service, first_id, first, late = crossing
+    second_id, other = _second_partial_order(service, broker, late.filled_at)
+    other_initial = replace(
+        first, broker_order_id=other.broker_order_id, broker_fill_id="second-first"
+    )
+    other_late = replace(
+        late, broker_order_id=other.broker_order_id, broker_fill_id="second-late"
+    )
+    with service.session_factory.begin() as session:
+        session.get(Order, first_id).status = "partially_filled"
+    broker.activities = [first, other_initial]
+    broker.later_activities = [first, late, other_initial, other_late]
+
+    commit = reconciliation._commit_reconciliation_mutations
+
+    def interrupt_after_first_status(session, *args):
+        first_order = session.get(Order, first_id)
+        reconciled = (
+            first_order.last_reconciled_at is not None
+            and first_order.acceptance_state == "accepted"
+        )
+        commit(session, *args)
+        if reconciled:
+            raise SystemExit("interrupted after first status commit")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            reconciliation,
+            "_commit_reconciliation_mutations",
+            interrupt_after_first_status,
+        )
+        with pytest.raises(SystemExit, match="after first status commit"):
+            _sync(service)
+
+    restarted = make_service(broker=broker)
+    assert not restarted.breakers.is_tripped(BreakerScope.broker_drift())
+    with service.session_factory() as session:
+        assert session.get(Order, first_id).acceptance_state == "accepted"
+        second_order = session.get(Order, second_id)
+        assert second_order.last_reconciled_at is None
+        assert second_order.last_error_code != "cumulative_fill_contradiction"
+        fills = session.scalars(select(Fill).where(Fill.order_id == second_id)).all()
+        assert {fill.broker_fill_id for fill in fills} == {
+            "second-first",
+            "second-late",
+        }
+        assert sum(fill.qty for fill in fills) == Decimal(".5")
+        assert second_order.acceptance_state == "fill_reconcile_required"
+        assert lifecycle_proof_matches(
+            session, service.session_factory, target_type="order", target_id=second_id
+        )
+    snapshot = restarted.snapshot_service.assemble_for_execution("AAPL")
+    assert not snapshot.broker_reconciled
+    assert not snapshot.daily_pnl_complete
+    report = restarted.reconciliation.reconcile(
+        **_mutation("restart with frozen contradiction")
+    )
+    assert any("below authoritative" in item for item in report.broker_drift)
+    assert restarted.breakers.is_tripped(BreakerScope.broker_drift())
