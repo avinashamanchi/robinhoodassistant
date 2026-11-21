@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
+from copy import copy
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -441,6 +442,15 @@ class AlpacaBroker(BrokerClient):
         self, after: datetime | None = None
     ) -> list[BrokerFill]:
         """Return exact Alpaca FILL activities, including IDs and exchange times."""
+        return self._read_fill_activities(after, single_page=False)
+
+    def refresh_fill_activities(self, *, after: datetime) -> list[BrokerFill]:
+        """One SDK GET for convergence. A full page cannot establish completeness."""
+        return self._read_fill_activities(after, single_page=True)
+
+    def _read_fill_activities(
+        self, after: datetime | None, *, single_page: bool,
+    ) -> list[BrokerFill]:
         params: dict[str, Any] = {
             "direction": "asc",
             "page_size": 100,
@@ -454,13 +464,22 @@ class AlpacaBroker(BrokerClient):
             normalized -= timedelta(seconds=1)
             params["after"] = normalized.isoformat().replace("+00:00", "Z")
 
+        trading = self._trading
+        if single_page and isinstance(trading, TradingClient):
+            # alpaca-py has no per-GET retry override. A shallow copy keeps
+            # the pinned session and leaves concurrent SDK callers untouched.
+            trading = copy(trading)
+            trading._retry = 0
         fills: list[BrokerFill] = []
         while True:
             page = _retry(
-                self._trading.get,
+                trading.get,
                 "/account/activities/FILL",
                 params,
+                attempts=1 if single_page else 3,
             )
+            if single_page and (not isinstance(page, list) or len(page) >= 100):
+                raise ValueError("incomplete fill activity refresh page")
             for raw in page:
                 raw_order_id = raw.get("order_id")
                 broker_order_id = (
