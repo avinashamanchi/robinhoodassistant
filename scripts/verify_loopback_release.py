@@ -172,10 +172,10 @@ _SECURITY_TEST_MANIFEST = TestManifest(
     ),
 )
 _SAFETY_TEST_MANIFEST = TestManifest(
-    count=142,
+    count=159,
     digest=(
-        "sha256:76c19857c99746deec00743d33567335f"
-        "43b7c5bf11869834a1a9eb8bfd100ab"
+        "sha256:f9e51ab8b3d3a961dcd8842159426fad"
+        "deb31529bbe3956b5568cd7697fa2d0a"
     ),
 )
 _FRONTEND_TEST_MANIFEST = TestManifest(
@@ -186,10 +186,10 @@ _FRONTEND_TEST_MANIFEST = TestManifest(
     ),
 )
 _FULL_TEST_MANIFEST = TestManifest(
-    count=5384,
+    count=5401,
     digest=(
-        "sha256:d6ff4bb70bcea6a47d894f27c78016b90"
-        "f0b5c8b8f7053b401a84e1bff96a15d"
+        "sha256:41c05b8de198690914316d73964fa354"
+        "4fd2e95d7153df9e9879d5e742caf855"
     ),
 )
 
@@ -1793,6 +1793,7 @@ class ReleaseVerifier:
                     "tests/test_breakers.py",
                     "tests/test_submission_barrier.py",
                     "tests/test_order_submission.py",
+                    "tests/test_fill_read_convergence.py",
                     "tests/stress/test_stress_scenarios.py",
                     "-v",
                 ),

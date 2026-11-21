@@ -117,9 +117,11 @@ does not establish current continuous uptime.
     handoff was accepted; the isolated local mock safety drill also passed.
     Report observation: `.local/improvements/task3-reviewed-report-observation.json`.
   - Collection manifests at this candidate: 5,291 full / 811 security tests.
-- Task 4: implementation and independent source review complete at `92e8756`;
-  current release and genuine baseline acceptance are recorded separately in
-  `.local/improvements/task4-acceptance.json` when verified. The daemon-owned
+- Task 4: implementation and available monitoring baseline accepted at
+  `831b023775f761be5dcae42006b9fb93f89c4288`; CI `44691536401` passed both
+  jobs and all mandatory checks. Its authenticated canonical report was imported.
+  Actual acceptance is recorded in `.local/improvements/task4-acceptance.json`.
+  The daemon-owned
   campaign observes exchange calendars, expected sessions and bounded typed
   receipts. Thirty future calendar days remain an ongoing observation requirement.
   - Review corrections prevent stale scans from certifying missed sessions or a
@@ -132,21 +134,34 @@ does not establish current continuous uptime.
   - The covering integration suite passed 536 tests; subsequent focused fixes
     passed 87 tests. Independent scoped review closed all Important findings.
     Controller verifier/boundary checks passed 69 tests. Full/security collections
-    are pinned to 5,384/904; actual complete CI remains an acceptance requirement.
+    are pinned to 5,384/904 at that release. CI passed 5,383 full tests with one
+    credentialed skip and 93.61% selected safety-module coverage.
   - Daemon, watchdog and doctor were placed in recorded development maintenance
-    during source changes. Release acceptance requires restoring all eight jobs,
-    observing fresh verified publications, and preserving the existing unsigned
-    campaign as historical material before starting a fresh verified period.
+    during source changes. All eight jobs were restored, doctor and campaign
+    publications were authenticated with the actual field-key ring, and the old
+    unsigned campaign was preserved byte-for-byte as historical material.
+    The verified period runs from November 20 at 13:30:08 UTC through December 20
+    at 13:30:08 UTC. Future sessions and the controlled restart remain pending.
   - The resumed real baseline has fresh local health and successful broker-sync
     receipts, but paper trading remains stopped by `broker_drift` and
     `operator_global`. Today's natural partial fills advanced between separate
     activity/status reads. An isolated fake-broker regression reproduces the
     non-atomic snapshot comparison. Corrective Task 4b remains the next
-    implementation step; its worker reported a usage-limit reset of November 24
-    at 3:08 PM. The already-reviewed campaign may be released to restore monitoring
-    while both trading latches remain active. Existing fill history remains intact.
-  - Telegram is paired, with 34 confirmed deliveries and one uncertain attempt at
-    the current observation. An uncertain send is retained and is not retried
-    automatically.
+    implementation step. Its implementation and independent review must finish
+    before guarded trading recovery. Existing fill history remains intact.
+  - Telegram pairing and delivery were confirmed. Uncertain attempts remain
+    recorded and are not retried automatically. AC sleep-prevention assertions
+    were observed at baseline acceptance; later power state remains measured.
+- Task 4b: partial-fill convergence source correction and independent review
+  complete at `7307560ed82168aa10a60f6130b32a2799a8b9f5`. One bounded additional
+  exact-activity read handles advancing partial fills, preserves the ordinary
+  account cursor, and durably latches refreshed orders until comparison.
+  Persistent or contradictory evidence still blocks trading. The initial
+  focused run passed 345 tests; the review-fix selection passed 155, including
+  all 17 dedicated convergence cases. Mandatory safety/full collections now
+  contain 159/5,401 tests. The daemon and watchdog remain in recorded development
+  maintenance, with both trading latches active. Exact-commit CI, canonical
+  runtime restoration and fresh guarded broker reconciliation remain required
+  before acceptance; the private receipt will be `task4b-acceptance.json`.
 - Task 5: pending.
 - Task 6: pending.

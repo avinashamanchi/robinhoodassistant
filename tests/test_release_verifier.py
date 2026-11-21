@@ -468,6 +468,7 @@ def test_release_verifier_has_only_the_exact_offline_commands():
                 "tests/test_breakers.py",
                 "tests/test_submission_barrier.py",
                 "tests/test_order_submission.py",
+                "tests/test_fill_read_convergence.py",
                 "tests/stress/test_stress_scenarios.py",
                 "-v",
             ),
