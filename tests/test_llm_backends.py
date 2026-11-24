@@ -237,7 +237,9 @@ def test_gemini_distinguishes_completed_error_responses_from_transport_failures(
     from trading_assistant.llm.base import ProviderRequestRejected
 
     class Models:
-        error = ServerError(503, {"error": {"code": 503, "message": "provider-sensitive-detail"}})
+        error = ServerError(503, {"error": {"code": 503, "status": "UNAVAILABLE",
+                                            "message": "provider-sensitive-detail"}},
+                            SimpleNamespace(status_code=503))
 
         def generate_content(self, **kwargs):
             raise self.error
@@ -245,7 +247,7 @@ def test_gemini_distinguishes_completed_error_responses_from_transport_failures(
     models = Models()
     backend = GeminiBackend("key", "model", client=SimpleNamespace(models=models))
     payload = dict(system="s", messages=[{"role": "user", "content": "hi"}], tools=[])
-    with pytest.raises(ProviderRequestRejected, match="^gemini_request_rejected$"):
+    with pytest.raises(ProviderRequestRejected, match="^unavailable$"):
         backend.create(**payload)
     models.error = TimeoutError("response missing")
     with pytest.raises(TimeoutError):

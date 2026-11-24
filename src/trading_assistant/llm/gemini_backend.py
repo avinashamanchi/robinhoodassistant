@@ -14,7 +14,10 @@ from ..security.outbound import (
     new_httpx_client,
     require_origin,
 )
-from .base import LLMResponse, ProviderRequestRejected, TextBlock, ToolUseBlock, Usage
+from .base import (
+    LLMResponse, ProviderRequestAmbiguous, ProviderRequestRejected, RejectionCode,
+    TextBlock, ToolUseBlock, Usage,
+)
 from .payloads import (
     build_gemini_payload,
     sanitize_gemini_schema,
@@ -23,6 +26,17 @@ from .payloads import (
 
 _GEMINI_ORIGIN = "https://generativelanguage.googleapis.com"
 _GEMINI_POLICY = OutboundPolicy(_GEMINI_ORIGIN)
+
+
+_CONFIRMED_REJECTIONS = {
+    (503, "UNAVAILABLE"): RejectionCode.UNAVAILABLE,
+    (401, "UNAUTHENTICATED"): RejectionCode.AUTHENTICATION,
+    (403, "PERMISSION_DENIED"): RejectionCode.AUTHENTICATION,
+    (400, "INVALID_ARGUMENT"): RejectionCode.INVALID_REQUEST,
+    (400, "FAILED_PRECONDITION"): RejectionCode.CONFIGURATION,
+    (404, "NOT_FOUND"): RejectionCode.CONFIGURATION,
+    (429, "RESOURCE_EXHAUSTED"): RejectionCode.QUOTA,
+}
 
 
 def _sanitize_schema(schema: Any) -> Any:
@@ -194,11 +208,24 @@ class GeminiBackend:
                 model=self.model, contents=gem_contents, config=config
             )
         except APIError as error:
-            # Google documents failed 4xx/5xx GenerateContent requests as
-            # unbilled. Transport failures still have ambiguous acceptance.
-            if type(error.code) is int and 400 <= error.code < 600:
-                raise ProviderRequestRejected("gemini_request_rejected") from None
-            raise
+            # Only trust the canonical Google error envelope on a matching HTTP
+            # response. A gateway page, timeout or local SDK error cannot prove
+            # the provider rejected this generation.
+            detail = error.details.get("error") if isinstance(error.details, dict) else None
+            status = error.code
+            if (
+                not isinstance(detail, dict)
+                or type(status) is not int
+                or getattr(error.response, "status_code", None) != status
+                or type(detail.get("code")) is not int
+                or detail["code"] != status
+                or not isinstance(detail.get("status"), str)
+            ):
+                raise ProviderRequestAmbiguous("provider_response_ambiguous") from None
+            code = _CONFIRMED_REJECTIONS.get((status, detail["status"]))
+            if code is None:
+                raise ProviderRequestAmbiguous("provider_response_ambiguous") from None
+            raise ProviderRequestRejected(code) from None
         return from_gemini(resp)
 
     @staticmethod

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from threading import Event
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -82,6 +83,7 @@ class Monitor:
         self._last_daily = None              # date of last daily-tasks run
         self._core_task: Optional[asyncio.Task[Any]] = None
         self._daily_task: Optional[asyncio.Task[Any]] = None
+        self._daily_cancel: Event | None = None
         self.rate_limiter = rate_limiter
         self.leases = leases
         self.provider_budget = provider_budget
@@ -248,11 +250,15 @@ class Monitor:
         self._core_task = None
 
     async def _bounded_daily_tasks(self) -> None:
+        from ..llm.cancellation import research_cancellation
+
         try:
-            await asyncio.wait_for(
-                asyncio.to_thread(self.run_daily_tasks),
-                timeout=self.daily_task_timeout,
-            )
+            with research_cancellation() as cancel:
+                self._daily_cancel = cancel
+                await asyncio.wait_for(
+                    asyncio.to_thread(self.run_daily_tasks),
+                    timeout=self.daily_task_timeout,
+                )
         except TimeoutError:
             log.error(
                 "daily analysis exceeded %.1fs; safety heartbeat loop continues",
@@ -411,6 +417,11 @@ class Monitor:
                 # Stop between symbols before tenure is released; the worker
                 # then fails its next ownership check instead of trading.
                 self.autopilot.request_cancel()
+            if self._daily_cancel is not None:
+                self._daily_cancel.set()
+            if self._daily_task is not None:
+                self._daily_task.cancel()
+                self._daily_task = None
             if guard is not None:
                 try:
                     released = guard.close()

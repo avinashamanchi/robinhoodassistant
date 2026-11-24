@@ -8,9 +8,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from threading import Event
 from typing import Any, Callable, Mapping, Protocol
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -20,6 +21,7 @@ from trading_assistant.db.models import (
     utcnow,
 )
 from trading_assistant.identity import canonical_request_id
+from .cancellation import ResearchCancelled
 from .payloads import (
     build_anthropic_payload,
     build_gemini_payload,
@@ -32,6 +34,8 @@ _MILLION = Decimal(1_000_000)
 _RESERVATION_STATES = frozenset(
     {"reserved", "started", "settled", "unknown", "released"}
 )
+RESEARCH_RETRY_CATEGORY = "analysis_retry"
+_DAILY_RESEARCH_RETRY_CALLS = 2
 _USAGE_OVERRUN_CODE = "provider_usage_over_reservation"
 _STALE_STARTED_CODE = "provider_started_usage_unknown"
 
@@ -42,6 +46,14 @@ class ProviderBudgetUnavailable(RuntimeError):
 
 class ProviderBudgetExceeded(ProviderBudgetUnavailable):
     """The requested reservation would cross a hard daily ceiling."""
+
+
+class ResearchRetryBudgetExceeded(ProviderBudgetExceeded):
+    """The daily research retry allocation has been consumed."""
+
+
+class ProviderReconciliationRequired(ProviderBudgetExceeded):
+    """Unresolved usage blocks further dispatch across budget days."""
 
 
 def _require_nonnegative_int(name: str, value: int) -> None:
@@ -297,7 +309,7 @@ class ProviderBudgetService:
             if unresolved is not None:
                 self._validate_day(unresolved)
                 session.commit()
-                raise ProviderBudgetExceeded(
+                raise ProviderReconciliationRequired(
                     "provider budget reconciliation required"
                 )
 
@@ -319,6 +331,20 @@ class ProviderBudgetService:
                 raise ProviderBudgetExceeded(
                     "provider daily budget exceeded"
                 )
+
+            if category == RESEARCH_RETRY_CATEGORY:
+                # The same SQLite write lock protects this count and BOTH budgets.
+                retries = session.scalar(select(func.count()).select_from(
+                    ProviderReservation
+                ).where(
+                    ProviderReservation.provider == provider,
+                    ProviderReservation.budget_day == budget_day,
+                    ProviderReservation.category == RESEARCH_RETRY_CATEGORY,
+                    ProviderReservation.state != "released",
+                ))
+                if retries >= _DAILY_RESEARCH_RETRY_CALLS:
+                    session.commit()
+                    raise ResearchRetryBudgetExceeded("research retry budget exceeded")
 
             if day is None:
                 day = ProviderBudgetDay(
@@ -371,9 +397,9 @@ class ProviderBudgetService:
         reservation_id: str,
         *,
         now: datetime | None = None,
+        cancel_event: Event | None = None,
     ) -> None:
         _require_text("reservation_id", reservation_id)
-        current = _as_utc(now or self._clock())
         with _budget_store_session(self._session_factory) as session:
             session.execute(text("BEGIN IMMEDIATE"))
             reservation = session.get(
@@ -395,6 +421,11 @@ class ProviderBudgetService:
                 raise ProviderBudgetUnavailable(
                     "provider reservation cannot be started"
                 )
+            # Check after acquiring the SQLite writer lock and validating the
+            # ledger. A cancelled reservation is still unstarted and expires normally.
+            if cancel_event is not None and cancel_event.is_set():
+                raise ResearchCancelled()
+            current = _as_utc(now or self._clock())
             if (
                 current < _as_utc(reservation.created_at)
                 or current >= _as_utc(reservation.expires_at)

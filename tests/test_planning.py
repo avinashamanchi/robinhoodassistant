@@ -462,20 +462,19 @@ def test_planning_accepts_64_character_request_id(make_service):
     assert analyst.request_ids == [request_id]
 
 
-def test_planning_repair_attempts_share_parent_id_but_reserve_separately(
+def test_planning_rejected_attempts_share_parent_id_but_reserve_separately(
     make_service,
 ):
-    class RepairBackend:
+    from trading_assistant.llm.base import ProviderRequestRejected, RejectionCode
+
+    class RejectThenPlanBackend:
         def __init__(self):
             plan_input = _plan().model_dump(
                 mode="json",
                 exclude={"symbol", "as_of", "reference_price"},
             )
             self.responses = [
-                SimpleNamespace(
-                    content=[SimpleNamespace(type="text", text="invalid")],
-                    usage=SimpleNamespace(input_tokens=1, output_tokens=1),
-                ),
+                ProviderRequestRejected(RejectionCode.UNAVAILABLE),
                 SimpleNamespace(
                     content=[
                         SimpleNamespace(
@@ -491,10 +490,13 @@ def test_planning_repair_attempts_share_parent_id_but_reserve_separately(
 
         def create(self, **kwargs):
             self.request_ids.append(kwargs["request_id"])
-            return self.responses.pop(0)
+            outcome = self.responses.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
 
     service = make_service()
-    delegate = RepairBackend()
+    delegate = RejectThenPlanBackend()
     budget = ProviderBudgetService(
         service.session_factory,
         BudgetLimits(
@@ -521,7 +523,7 @@ def test_planning_repair_attempts_share_parent_id_but_reserve_separately(
     planning.analyze(
         "AAPL",
         actor="operator:test",
-        reason="repair invalid structured plan",
+        reason="retry confirmed unavailable provider",
         request_id="planning-repair-parent",
     )
 

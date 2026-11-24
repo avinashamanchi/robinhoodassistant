@@ -12,11 +12,11 @@ import json
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
-from ..dependencies import RequiredDependencyUnavailable
 from ..identity import canonical_request_id
 from ..signals.models import MarketFeatures
 from .citations import validate_source_citations
 from .models import AnalysisReport
+from .research import ResearchTask
 from .untrusted import (
     UntrustedSummary,
     validate_summary_for_privileged_use,
@@ -226,14 +226,6 @@ class Analyst:
             )
         return prompt
 
-    def _create(self, **kwargs):
-        try:
-            return self.backend.create(**kwargs)
-        except RequiredDependencyUnavailable:
-            raise
-        except Exception:
-            raise RequiredDependencyUnavailable from None
-
     def analyze(
         self,
         features: MarketFeatures,
@@ -242,38 +234,48 @@ class Analyst:
         *,
         request_id: str,
     ) -> AnalysisReport:
-        budget_request_id = canonical_request_id(request_id)
-        if untrusted_summary is not None:
-            validate_summary_for_privileged_use(untrusted_summary)
-        resp = self._create(
-            system=SYSTEM_PREAMBLE,
-            messages=[
-                {
-                    "role": "user",
-                    "content": self._prompt(
-                        features,
-                        held_symbols or [],
-                        untrusted_summary,
-                    ),
-                }
-            ],
-            tools=[SUBMIT_TOOL],
-            tool_choice="any",   # structured output is mandatory for the analyst
-            request_id=budget_request_id,
+        return self._analyze(features, held_symbols, untrusted_summary, request_id, plan=False)
+
+    def _analyze(self, features, held_symbols, untrusted_summary, request_id, *, plan):
+        request_id = canonical_request_id(request_id)
+        task = ResearchTask(
+            self.backend, kind="plan" if plan else "report",
+            request_id=request_id, max_attempts=self.max_attempts,
         )
-        report = self._parse(resp, features)
-        validate_source_citations(report, untrusted_summary)
-        self._enforce_quality(report, features)
-        return self._apply_regime_filter(report, features)
+        with task.observe():
+            if untrusted_summary is not None:
+                validate_summary_for_privileged_use(untrusted_summary)
+            prompt = self._prompt(features, held_symbols or [], untrusted_summary)
+            response = task.create(
+                system=PLAN_PREAMBLE if plan else SYSTEM_PREAMBLE,
+                messages=[{"role": "user", "content": prompt}],
+                tools=[SUBMIT_PLAN_TOOL if plan else SUBMIT_TOOL],
+                tool_choice="any",
+                request_id=request_id,
+            )
+            task.check_cancelled()
+            try:
+                parse = self._parse_plan if plan else self._parse
+                report = parse(response, features)
+                validate_source_citations(report, untrusted_summary)
+                self._enforce_quality(report, features)
+            except (TypeError, ValueError):
+                if plan:
+                    raise ValueError("analyst plan remained invalid") from None
+                raise
+            return self._apply_regime_filter(report, features)
 
     @staticmethod
     def _parse(resp: Any, features: MarketFeatures) -> AnalysisReport:
         for block in getattr(resp, "content", []):
             if getattr(block, "type", None) == "tool_use" and block.name == "submit_analysis":
-                data = dict(block.input)
-                data["symbol"] = features.symbol
-                data["as_of"] = features.as_of
-                return AnalysisReport(**data)
+                try:
+                    data = dict(block.input)
+                    data["symbol"] = features.symbol
+                    data["as_of"] = features.as_of
+                    return AnalysisReport(**data)
+                except (TypeError, ValueError):
+                    raise ValueError("analyst report remained invalid") from None
         raise ValueError("analyst did not submit an analysis")
 
     def analyze_plan(
@@ -285,67 +287,26 @@ class Analyst:
         request_id: str,
     ):
         """Produce a full TradePlan (scenarios, invalidation, entry ladder, exits)."""
+        return self._analyze(features, held_symbols, untrusted_summary, request_id, plan=True)
+
+    @staticmethod
+    def _parse_plan(resp, features):
         from decimal import Decimal
 
         from .models import TradePlan
 
-        if untrusted_summary is not None:
-            validate_summary_for_privileged_use(untrusted_summary)
-        system = PLAN_PREAMBLE
-        user = self._prompt(
-            features,
-            held_symbols or [],
-            untrusted_summary,
+        blocks = [
+            block for block in getattr(resp, "content", [])
+            if getattr(block, "type", None) == "tool_use"
+        ]
+        if len(blocks) != 1 or blocks[0].name != "submit_plan":
+            raise ValueError("analyst must submit exactly one plan")
+        data = dict(blocks[0].input)
+        data.update(
+            symbol=features.symbol, as_of=features.as_of,
+            reference_price=Decimal(str(features.last_close or 0)),
         )
-
-        validation_error: ValueError | None = None
-        budget_request_id = canonical_request_id(request_id)
-        for _ in range(self.max_attempts):
-            prompt = user
-            if validation_error is not None:
-                summary = str(validation_error)[:1200]
-                prompt += (
-                    "\n\nYour previous submit_plan failed deterministic validation:\n"
-                    f"{summary}\n"
-                    "Return one complete corrected submit_plan. Preserve the thesis "
-                    "where possible, but satisfy every trade-plan rule exactly."
-                )
-            resp = self._create(
-                system=system,
-                messages=[{"role": "user", "content": prompt}],
-                tools=[SUBMIT_PLAN_TOOL],
-                tool_choice="any",   # the plan tool call is mandatory
-                request_id=budget_request_id,
-            )
-            try:
-                block = next(
-                    block
-                    for block in getattr(resp, "content", [])
-                    if (
-                        getattr(block, "type", None) == "tool_use"
-                        and block.name == "submit_plan"
-                    )
-                )
-                data = dict(block.input)
-                data["symbol"] = features.symbol
-                data["as_of"] = features.as_of
-                data["reference_price"] = Decimal(str(features.last_close or 0))
-                plan = TradePlan(**data)
-                validate_source_citations(
-                    plan,
-                    untrusted_summary,
-                )
-                self._enforce_quality(plan, features)
-                return self._apply_regime_filter(plan, features)
-            except StopIteration:
-                validation_error = ValueError("analyst did not submit a plan")
-            except ValueError as exc:
-                validation_error = exc
-
-        raise ValueError(
-            "analyst plan remained invalid after "
-            f"{self.max_attempts} structured attempts"
-        ) from validation_error
+        return TradePlan(**data)
 
     def _apply_regime_filter(self, report, features: MarketFeatures):
         """v2: force HOLD/NO_TRADE in RANGING regimes (deterministic post-filter)."""

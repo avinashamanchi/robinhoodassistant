@@ -107,87 +107,23 @@ def test_suppression_off_leaves_buy():
     ).action is AnalystAction.BUY
 
 
-def test_plan_validation_failure_gets_one_bounded_repair_attempt():
+def test_plan_validation_failure_stops_without_paid_repair():
     invalid = deepcopy(_PLAN_INPUT)
     invalid["exit_plan"]["stop"] = 80
-    outputs = [invalid, deepcopy(_PLAN_INPUT)]
+    calls = []
 
-    class SequenceBackend:
-        def __init__(self):
-            self.calls = []
-            self.request_ids = []
+    class InvalidBackend:
+        def create(self, **kwargs):
+            calls.append(kwargs["request_id"])
+            return SimpleNamespace(content=[SimpleNamespace(
+                type="tool_use", name="submit_plan", input=invalid,
+            )])
 
-        def create(
-            self,
-            *,
-            system,
-            messages,
-            tools,
-            tool_choice=None,
-            request_id,
-        ):
-            self.calls.append(messages)
-            self.request_ids.append(request_id)
-            data = outputs[len(self.calls) - 1]
-            block = SimpleNamespace(
-                type="tool_use", name="submit_plan", id="t", input=data
-            )
-            return SimpleNamespace(content=[block])
-
-    backend = SequenceBackend()
-    plan = Analyst(
-        backend,
-        max_attempts=2,
-    ).analyze_plan(
-        _feat(Regime.TRENDING_UP),
-        request_id="structured-repair-request",
-    )
-
-    assert plan.exit_plan.stop == 92
-    assert len(backend.calls) == 2
-    assert backend.request_ids == [
-        "structured-repair-request",
-        "structured-repair-request",
-    ]
-    assert "failed deterministic validation" in backend.calls[1][0]["content"]
-
-
-def test_plan_repair_is_capped_at_one_retry():
-    invalid = deepcopy(_PLAN_INPUT)
-    invalid["exit_plan"]["stop"] = 80
-
-    class AlwaysInvalidBackend:
-        def __init__(self):
-            self.calls = 0
-
-        def create(
-            self,
-            *,
-            system,
-            messages,
-            tools,
-            tool_choice=None,
-            request_id,
-        ):
-            self.calls += 1
-            block = SimpleNamespace(
-                type="tool_use",
-                name="submit_plan",
-                id="t",
-                input=deepcopy(invalid),
-            )
-            return SimpleNamespace(content=[block])
-
-    backend = AlwaysInvalidBackend()
-    with pytest.raises(ValueError, match="after 2 structured attempts"):
-        Analyst(
-            backend,
-            max_attempts=2,
-        ).analyze_plan(
-            _feat(Regime.TRENDING_UP),
-            request_id="analyst-v2-repair-cap",
+    with pytest.raises(ValueError, match="remained invalid"):
+        Analyst(InvalidBackend(), max_attempts=2).analyze_plan(
+            _feat(Regime.TRENDING_UP), request_id="invalid-plan"
         )
-    assert backend.calls == 2
+    assert calls == ["invalid-plan"]
 
 
 # ── confidence neutralized ──────────────────────────────────────

@@ -36,6 +36,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool
 
 from ..db.models import Fill, Order, fill_has_trusted_identity
+from .research_metrics import research_metrics
 
 _SUBMITTED_OPEN = {"submitting", "submitted", "partially_filled", "acceptance_unknown"}
 _ZERO = Decimal(0)
@@ -308,6 +309,7 @@ def build_report(
             "since": None if since is None else since.isoformat(),
             "until": None if until is None else until.isoformat(),
         },
+        "research": research_metrics(session, since=since, until=until),
         "funnel": _funnel(orders),
         "fills": {
             "trusted": sum(fill.trusted for fill in window_fills),
@@ -501,6 +503,18 @@ def render_text(report: dict[str, object]) -> str:
             f" ({summary['wins']} wins, {summary['losses']} losses), average hold"
             f" {summary['average_holding_hours']} h, turnover {summary['turnover']}"
         )
+    research = report.get("research")
+    if research is not None:
+        plans = research["structured_plans"]
+        rate = "unknown" if plans["rate"] is None else f"{plans['rate']:.1%}"
+        lines += [
+            "", "Research reliability",
+            f"  valid structured plans {plans['valid']} / {plans['started']} tasks ({rate}), "
+            f"{plans['unknown']} unknown outcomes",
+            f"  provider attempts {research['attempts_started']} including "
+            f"{research['retry_attempts_started']} retries, ledger states {research['attempt_states']}",
+            f"  task outcomes {research['task_outcomes']}, confirmed rejections {research['confirmed_rejections']}",
+        ]
     equity = report.get("equity")
     if equity is not None:
         lines += ["", "Account equity (daemon snapshots)", f"  {equity}"]

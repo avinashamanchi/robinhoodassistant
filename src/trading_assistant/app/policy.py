@@ -1517,6 +1517,15 @@ async def _call_with_lease_renewal(
     *,
     panic_request_id: str | None,
 ) -> tuple[Response | None, Literal["lost", "store"] | None]:
+    from ..llm.cancellation import research_cancellation
+
+    with research_cancellation() as cancel_research:
+        return await _await_leased_handler(
+            app, request, call_next, hold, panic_request_id, cancel_research,
+        )
+
+
+async def _await_leased_handler(app, request, call_next, hold, panic_request_id, cancel_research):
     stop = asyncio.Event()
     handler = asyncio.create_task(call_next(request))
     renewal = asyncio.create_task(
@@ -1535,8 +1544,11 @@ async def _call_with_lease_renewal(
         )
         if renewal in done:
             renewal_result = renewal.result()
+            if renewal_result is not None:
+                cancel_research.set()
         response = await asyncio.shield(handler)
     except asyncio.CancelledError:
+        cancel_research.set()
         try:
             await _await_task_shielded(handler)
         except BaseException:
