@@ -261,3 +261,44 @@ def test_an_explicit_database_is_reported_read_only_without_secrets(session_fact
 
     assert "PAPER EVALUATION REPORT" in capsys.readouterr().out
     assert (tmp_path / "test.db").stat().st_mtime_ns == before
+
+
+def test_logical_task_rates_cover_mixed_incomplete_and_empty_windows(session_factory, tmp_path):
+    from sqlalchemy import select
+
+    from trading_assistant.db.models import AuditEvent
+    from trading_assistant.operations.audit import AuditRecorder, MutationContext
+
+    context = MutationContext("analyst", "one-batch", "research report fixture")
+    recorder = AuditRecorder(session_factory)
+    for index, (kind, outcome) in enumerate([
+        ("report", "completed"), ("plan", "completed"), ("plan", "invalid_output"),
+        ("report", "budget_exhausted"), ("plan", "cancelled"),
+    ]):
+        for code in ("started", outcome):
+            recorder.record(context, "research.task", kind, str(index), code)
+    with read_only_session_factory(tmp_path / "test.db")() as session:
+        events = session.scalars(select(AuditEvent).order_by(AuditEvent.id)).all()
+        complete = build_report(session, since=events[0].created_at)
+        incomplete = build_report(session, until=events[-1].created_at)
+        empty = build_report(session, until=events[0].created_at)
+
+    for report, starts, completed, failed, completion_rate, failure_rate in [
+        (complete, 5, 2, 1, .4, .2),
+        (incomplete, 5, 2, 1, None, None),
+        (empty, 0, 0, 0, None, None),
+    ]:
+        rates = report["research"]["logical_task_rates"]
+        assert rates["denominator"] == starts
+        assert "plan and report" in rates["denominator_basis"]
+        assert rates["completed"] == completed
+        assert rates["failed"] == failed
+        assert rates["completion_rate"] == completion_rate
+        assert rates["failure_rate"] == failure_rate
+        text = paper_report.render_text(report)
+        completion = "unknown" if completion_rate is None else "40.0%"
+        failure = "unknown" if failure_rate is None else "20.0%"
+        assert f"completed {completed} / {starts} ({completion})" in text
+        assert f"failed {failed} / {starts} ({failure})" in text
+    assert "1 blocked, 1 cancelled, 0 unknown" in paper_report.render_text(complete)
+    assert "1 blocked, 0 cancelled, 1 unknown" in paper_report.render_text(incomplete)

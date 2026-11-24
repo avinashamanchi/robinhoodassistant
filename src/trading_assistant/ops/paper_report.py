@@ -460,6 +460,10 @@ def autopilot_summary(cycles: list[object]) -> dict[str, object]:
     }
 
 
+def _format_rate(value: float | None) -> str:
+    return "unknown" if value is None else f"{value:.1%}"
+
+
 def render_text(report: dict[str, object]) -> str:
     funnel = report["funnel"]
     pnl = report["pnl"]
@@ -506,9 +510,20 @@ def render_text(report: dict[str, object]) -> str:
     research = report.get("research")
     if research is not None:
         plans = research["structured_plans"]
-        rate = "unknown" if plans["rate"] is None else f"{plans['rate']:.1%}"
+        rate = _format_rate(plans["rate"])
+        lines += ["", "Research reliability"]
+        rates = research.get("logical_task_rates")
+        if rates is not None:
+            total = rates["denominator"]
+            states = research["task_states"]
+            lines += [
+                f"  of all plan and report tasks started in the window: "
+                f"completed {rates['completed']} / {total} ({_format_rate(rates['completion_rate'])}), "
+                f"failed {rates['failed']} / {total} ({_format_rate(rates['failure_rate'])})",
+                f"  {states.get('blocked', 0)} blocked, {states.get('cancelled', 0)} cancelled, "
+                f"{states.get('unknown', 0)} unknown",
+            ]
         lines += [
-            "", "Research reliability",
             f"  valid structured plans {plans['valid']} / {plans['started']} tasks ({rate}), "
             f"{plans['unknown']} unknown outcomes",
             f"  provider attempts {research['attempts_started']} including "

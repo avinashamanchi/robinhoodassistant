@@ -44,11 +44,15 @@ def research_metrics(session, *, since=None, until=None):
         if outcome in {"unknown", TaskOutcome.COMPLETED, TaskOutcome.CANCELLED}:
             state = outcome
         elif outcome in {TaskOutcome.BUDGET, TaskOutcome.RETRY_BUDGET,
-                         TaskOutcome.METER, TaskOutcome.RECONCILIATION}:
+                         TaskOutcome.METER, TaskOutcome.RECONCILIATION, TaskOutcome.RECEIPT}:
             state = "blocked"
         else:
             state = "failed"
         task_states[state] += 1
+    total_tasks = len(kinds)
+    rates_known = total_tasks > 0 and task_states["unknown"] == 0
+    completed = task_states["completed"]
+    failed = task_states["failed"]
     plans = Counter(outcomes[task_id] for task_id in kinds if kinds[task_id] == "plan")
     started, valid, unknown = plans.total(), plans["completed"], plans["unknown"]
 
@@ -86,7 +90,17 @@ def research_metrics(session, *, since=None, until=None):
         "coverage": "An open start includes all recorded history. Earlier uninstrumented task outcomes are unknown.",
         "attempt_basis": "Durable dispatch starts in the window, with current ledger states. "
                          "Settled token counts can include audited conservative charges.",
-        "logical_tasks_started": len(kinds),
+        "logical_tasks_started": total_tasks,
+        "logical_task_rates": {
+            "denominator": total_tasks,
+            "denominator_basis": "All observed plan and report tasks started in [since, until), "
+                                 "including blocked and cancelled tasks. Rates are unknown for "
+                                 "an empty cohort or any missing terminal outcome.",
+            "completed": completed,
+            "failed": failed,
+            "completion_rate": completed / total_tasks if rates_known else None,
+            "failure_rate": failed / total_tasks if rates_known else None,
+        },
         "task_states": dict(task_states),
         "task_outcomes": dict(Counter(outcomes.values())),
         "structured_plans": {"valid": valid, "started": started, "unknown": unknown,

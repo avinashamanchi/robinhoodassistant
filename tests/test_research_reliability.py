@@ -50,6 +50,8 @@ def research(monkeypatch, session_factory):
         def serve(request):
             attempts.append(request.url.host)
             item = script[len(attempts) - 1]
+            if callable(item):
+                return item(request)
             if isinstance(item, BaseException):
                 raise item
             return item
@@ -428,3 +430,52 @@ def test_cancellation_survives_terminal_receipt_write_failure(research, session_
         analyst.analyze_plan(FEATURES, request_id=REQUEST)
     assert len(attempts) == 1
     assert metrics(session_factory)["structured_plans"]["rate"] is None
+
+
+def test_owner_cancellation_during_inflight_transport_error_keeps_attempt_unknown(
+    research, session_factory,
+):
+    from trading_assistant.llm.cancellation import ResearchCancelled, research_cancellation
+
+    with research_cancellation() as stop:
+        def cancel_and_timeout(_request):
+            stop.set()
+            raise httpx.ReadTimeout(MARKER)
+
+        analyst, attempts = research([cancel_and_timeout, success()])
+        with pytest.raises(RequiredDependencyUnavailable) as error:
+            analyst.analyze_plan(FEATURES, request_id=REQUEST)
+
+    assert len(attempts) == 1
+    row, = ledger(session_factory)
+    assert row.state == "unknown"
+    assert row.input_actual is None and row.output_actual is None
+    assert row.input_reserved > 0 and row.output_reserved == 128
+    assert metrics(session_factory)["task_outcomes"] == {"cancelled": 1}
+    assert isinstance(error.value, ResearchCancelled)
+
+
+def test_rejection_receipt_write_failure_stops_retry_and_reports_local_cause(
+    research, session_factory, monkeypatch,
+):
+    from trading_assistant.operations.audit import AuditRecorder
+
+    original = AuditRecorder.record
+    def fail_only_rejection(self, context, action, kind, task_id, code):
+        if action == "research.rejection":
+            raise OSError(MARKER)
+        return original(self, context, action, kind, task_id, code)
+
+    monkeypatch.setattr(AuditRecorder, "record", fail_only_rejection)
+    analyst, attempts = research([rejection(503, "UNAVAILABLE"), success()])
+    with pytest.raises(RequiredDependencyUnavailable) as error:
+        analyst.analyze_plan(FEATURES, request_id=REQUEST)
+
+    assert len(attempts) == 1
+    row, = ledger(session_factory)
+    assert (row.state, row.input_actual, row.output_actual) == ("settled", 0, 0)
+    summary = metrics(session_factory)
+    assert summary["task_outcomes"] == {"receipt_unavailable": 1}
+    assert summary["task_states"] == {"blocked": 1}
+    assert summary["confirmed_rejections"] == {}
+    assert MARKER not in json.dumps(summary) and MARKER not in str(error.value)

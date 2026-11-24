@@ -27,8 +27,13 @@ class TaskOutcome(StrEnum):
     BUDGET = "budget_exhausted"
     RETRY_BUDGET = "retry_budget_exhausted"
     METER = "meter_unavailable"
+    RECEIPT = "receipt_unavailable"
     AMBIGUOUS = "ambiguous"
     FAILED = "failed"
+
+
+class _ReceiptUnavailable(RequiredDependencyUnavailable):
+    """Local research instrumentation could not persist a receipt."""
 
 
 class ResearchTask:
@@ -48,11 +53,11 @@ class ResearchTask:
             try:
                 self.recorder.record(self.context, action, self.kind, self.task_id, code)
             except Exception:
-                raise RequiredDependencyUnavailable() from None
+                raise _ReceiptUnavailable() from None
 
     def check_cancelled(self):
         if self.cancel.is_set():
-            raise ResearchCancelled()
+            raise ResearchCancelled() from None
 
     @contextmanager
     def observe(self):
@@ -83,6 +88,9 @@ class ResearchTask:
         except (ValueError, TypeError):
             self.record("research.task", TaskOutcome.INVALID)
             raise
+        except _ReceiptUnavailable:
+            self.record("research.task", TaskOutcome.RECEIPT)
+            raise
         except RequiredDependencyUnavailable:
             self.record("research.task", TaskOutcome.AMBIGUOUS)
             raise
@@ -112,5 +120,8 @@ class ResearchTask:
             except (ProviderBudgetUnavailable, ResearchCancelled, CancelledError):
                 raise
             except Exception:
+                # The backend has already reconciled this attempt. Its unknown
+                # usage survives even when the owner cancelled the logical task.
+                self.check_cancelled()
                 raise RequiredDependencyUnavailable() from None
         raise AssertionError("unreachable")
