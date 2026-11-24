@@ -2,9 +2,12 @@
 
 Spec: `docs/superpowers/specs/2026-11-15-operational-improvements-design.md`
 
-Execute sequentially in the current designated feature checkout. Preserve the
-paper-only and risk/approval boundaries. Do not move the production database or
-install a second broker runtime. The user has authorized the six milestones;
+Execute sequentially. After Task 4b, implement in the managed code-only
+development checkout and deploy each reviewed, verified candidate to the existing
+designated Mac installation. Keep the running source stable during development.
+Preserve the paper-only and risk/approval boundaries. Do not copy private runtime
+files, move the production database, change its designation, or install a second
+broker runtime. The user has authorized the six milestones;
 the user selected the existing Mac with AC-powered unattended operation and
 Telegram incident alerts. Current power and delivery evidence must be observed,
 not inferred from those choices.

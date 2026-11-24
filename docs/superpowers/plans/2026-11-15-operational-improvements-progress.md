@@ -6,8 +6,10 @@ Starting commit: `3257456efa76189506b483b0e4b4ca69a5ee2f74`
 Authorization: user requested all six recommendations, one by one, with accurate
 completion. Existing strategy, sizing, approval and risk settings remain intact.
 
-Ruling: implement in the designated feature checkout, not a second trading
-worktree — installation and broker ownership are tied to this source tree.
+Ruling: the runtime remains the designated checkout. After Task 4b, later code
+changes use an isolated managed development checkout with its own test environment.
+Private configuration, credentials and the production database stay at the runtime.
+Each candidate requires review and CI before deployment to the designated source.
 
 Ruling: continue within the approved six-item scope without another design
 approval round — user explicitly requested implementation of that roadmap.
@@ -152,16 +154,42 @@ does not establish current continuous uptime.
   - Telegram pairing and delivery were confirmed. Uncertain attempts remain
     recorded and are not retried automatically. AC sleep-prevention assertions
     were observed at baseline acceptance; later power state remains measured.
-- Task 4b: partial-fill convergence source correction and independent review
-  complete at `7307560ed82168aa10a60f6130b32a2799a8b9f5`. One bounded additional
+- Task 4b: complete and accepted at `b86f4de6e99ee7f3fd42407c31bb1cbe460182d7`.
+  CI `44949778127` passed every job and mandatory check; the actual canonical
+  report was imported. Full suite: 5,400 passed and one credentialed skip;
+  selected safety-module coverage: 93.65%. One bounded additional
   exact-activity read handles advancing partial fills, preserves the ordinary
   account cursor, and durably latches refreshed orders until comparison.
   Persistent or contradictory evidence still blocks trading. The initial
   focused run passed 345 tests; the review-fix selection passed 155, including
   all 17 dedicated convergence cases. Mandatory safety/full collections now
-  contain 159/5,401 tests. The daemon and watchdog remain in recorded development
-  maintenance, with both trading latches active. Exact-commit CI, canonical
-  runtime restoration and fresh guarded broker reconciliation remain required
-  before acceptance; the private receipt will be `task4b-acceptance.json`.
-- Task 5: pending.
+  contain 159/5,401 tests. All eight managed jobs were restored. Fresh real order
+  and position reconciliation passed without cancellations. Separate guarded
+  resets advanced broker drift from generation 6 to 7 and the global stop from
+  generation 3 to 4; live health has no active breakers. The daemon and authenticated
+  API report Paper READY with the unchanged approval fingerprint. Orders/fills
+  remain 7/15; database integrity and foreign-key checks pass. Signed doctor and
+  campaign observations verified; AC power and both sleep assertions were observed.
+  The private runtime receipt is `task4b-acceptance.json`. No new natural partial-fill
+  crossing or complete future month is claimed; controlled restart remains pending.
+- Task 5: source implementation and independent review complete at `95949b0`,
+  based on `b86f4de` in the isolated development checkout. Retries require a
+  confirmed transient rejection and a fresh atomic reservation, with at most one
+  additional attempt per task and two retry reservations per provider per UTC day,
+  inside the original global ceilings. Ambiguous acceptance stays unknown;
+  cancellation prevents further attempts. Reports distinguish logical tasks from
+  paid attempts and show completion, failure and validated-plan rates with explicit
+  cohorts and unknown outcomes. Local instrumentation errors remain separate from
+  upstream ambiguity. No fallback, approval or execution authority was added.
+  - The locked development baseline passed 339 tests. The affected implementation
+    run passed 778; review-fix verification passed 47. All three Important review
+    findings were addressed with RED/GREEN regressions and scoped re-review.
+    Release-boundary checks passed 69 and the static safety gate passed.
+  - Full/security collections are pinned to 5,433/1,108 tests. Current-commit CI,
+    deployment, conservative historical budget recovery and a bounded real-provider
+    check remain required. Private actual acceptance will be recorded separately
+    in `.local/improvements/task5-acceptance.json`.
+  - The designated Paper runtime continues on its accepted release during CI.
+    The historical holdout remains preserved. Synthetic integration fixtures do
+    not establish actual provider billing or strategy performance.
 - Task 6: pending.
