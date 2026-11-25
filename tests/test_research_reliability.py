@@ -479,3 +479,55 @@ def test_rejection_receipt_write_failure_stops_retry_and_reports_local_cause(
     assert summary["task_states"] == {"blocked": 1}
     assert summary["confirmed_rejections"] == {}
     assert MARKER not in json.dumps(summary) and MARKER not in str(error.value)
+
+
+@pytest.mark.parametrize("tool_name", ["submit_plan", "submit_analysis"])
+@pytest.mark.parametrize("summary_kind,returned_refs,valid", [
+    ("none", [], True), ("facts", ["s2"], True), ("metadata", [], True),
+    ("none", ["s2"], False), ("facts", ["s9"], False),
+    ("facts", ["s1"], False),
+])
+def test_gemini_wire_citation_contract(research, session_factory, tool_name, summary_kind, returned_refs, valid):
+    from trading_assistant.analyst.untrusted import UntrustedFact, UntrustedSummary
+    from tests.test_untrusted_model_quarantine import ANALYSIS_INPUT, PLAN_INPUT
+
+    summary = None
+    if summary_kind != "none":
+        facts = (UntrustedFact(text="Demand increased.", source_ref="s2"),) if summary_kind == "facts" else ()
+        summary = UntrustedSummary(facts=facts, source_refs=("s1", "s2"), uncertainties=(), injection_flags=())
+    received = []
+    def respond(request):
+        received.append(json.loads(request.content))
+        args = dict(PLAN_INPUT if tool_name == "submit_plan" else ANALYSIS_INPUT, cited_source_refs=returned_refs)
+        return httpx.Response(200, json={
+            "candidates": [{"content": {"parts": [{"functionCall": {"name": tool_name, "args": args}}]}}],
+            "usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 1},
+        })
+
+    analyst, attempts = research([respond])
+    run = analyst.analyze_plan if tool_name == "submit_plan" else analyst.analyze
+    if valid:
+        assert run(FEATURES, request_id=REQUEST, untrusted_summary=summary).cited_source_refs == returned_refs
+    else:
+        with pytest.raises(ValueError):
+            run(FEATURES, request_id=REQUEST, untrusted_summary=summary)
+    assert len(attempts) == len(ledger(session_factory)) == 1
+    body, = received
+    declaration, = body["tools"][0]["functionDeclarations"]
+    assert declaration["name"] == tool_name
+    params = declaration["parameters"]
+    assert "cited_source_refs" in params["required"]
+    refs = params["properties"]["cited_source_refs"]
+    prompt = body["contents"][0]["parts"][0]["text"]
+    assert "cited_concepts" in prompt and "playbook" in prompt.lower()
+    assert refs["description"] in prompt
+    if summary is None:
+        assert refs["max_items"] == 0
+        assert "cited_source_refs" in prompt and "[]" in prompt
+    else:
+        assert refs["items"]["enum"] == ["s1", "s2"]
+        assert refs["max_items"] == 2
+        assert refs.get("min_items", 0) == (1 if summary.facts else 0)
+        assert json.dumps(["s1", "s2"]) in refs["description"]
+        if summary.facts:
+            assert "at least one" in prompt and "fact" in prompt

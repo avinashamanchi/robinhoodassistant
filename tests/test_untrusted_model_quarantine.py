@@ -1230,3 +1230,46 @@ def test_legacy_raw_news_seam_is_absent_from_privileged_interfaces():
     assert "news:" not in planning_source
     assert "format_news_context" not in news_source
     assert "NEWS_GUARD" not in news_source
+
+
+@pytest.mark.parametrize("tool_name", ["submit_analysis", "submit_plan"])
+def test_interleaved_citation_schemas_preserve_global_templates(tool_name):
+    from concurrent.futures import ThreadPoolExecutor
+    from copy import deepcopy
+    from threading import Barrier
+    from trading_assistant.analyst.analyst import SUBMIT_TOOL, SUBMIT_PLAN_TOOL
+
+    template = SUBMIT_PLAN_TOOL if tool_name == "submit_plan" else SUBMIT_TOOL
+    baseline = deepcopy(template)
+    barrier = Barrier(3, timeout=5)
+    calls = {}
+    class InterleavedBackend:
+        def create(self, **kwargs):
+            request_id = kwargs["request_id"]
+            calls[request_id] = kwargs["tools"][0]
+            barrier.wait()
+            source_refs = [] if request_id == "none" else [request_id]
+            data = PLAN_INPUT if tool_name == "submit_plan" else ANALYSIS_INPUT
+            block = SimpleNamespace(type="tool_use", name=tool_name, input=dict(data, cited_source_refs=source_refs))
+            return SimpleNamespace(content=[block])
+
+    analyst = Analyst(InterleavedBackend(), max_attempts=2)
+    run = analyst.analyze_plan if tool_name == "submit_plan" else analyst.analyze
+    def invoke(ref):
+        summary = None if ref == "none" else UntrustedSummary(
+            facts=(UntrustedFact(text="Demand increased.", source_ref=ref),),
+            source_refs=(ref,), uncertainties=(), injection_flags=(),
+        )
+        return run(_features(), untrusted_summary=summary, request_id=ref).cited_source_refs
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(invoke, ["s1", "none", "s2"])) == [["s1"], [], ["s2"]]
+    assert template == baseline
+    for ref, tool in calls.items():
+        fields = tool["input_schema"]["properties"]
+        assert fields["cited_concepts"] is not template["input_schema"]["properties"]["cited_concepts"]
+        source_refs = fields["cited_source_refs"]
+        if ref == "none":
+            assert source_refs["maxItems"] == 0
+        else:
+            assert source_refs["items"]["enum"] == [ref]

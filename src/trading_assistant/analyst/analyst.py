@@ -9,6 +9,7 @@ swappable Protocol the agent uses, so tests run a scripted backend with no key.
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
@@ -33,8 +34,8 @@ SYSTEM_PREAMBLE = (
     "estimate an indicator. Follow the playbook below. You MUST cite which playbook "
     "concepts drove your thesis, state the current regime and how it conditioned "
     "your read, address earnings if a date is within your horizon, and flag "
-    "correlation with existing holdings. Submit exactly one analysis via the "
-    "submit_analysis tool. HOLD is a valid, often correct answer.\n\n"
+    "correlation with existing holdings. Submit exactly one result using the provided "
+    "tool. HOLD is a valid, often correct answer.\n\n"
     "=== PLAYBOOK ===\n" + _PLAYBOOK
 )
 
@@ -167,6 +168,24 @@ SUBMIT_PLAN_TOOL: dict[str, Any] = {
 }
 
 
+def _submission_tool(*, plan: bool, summary: UntrustedSummary | None) -> dict:
+    """Specialize a fresh tool using the already validated summary's opaque IDs."""
+    tool = deepcopy(SUBMIT_PLAN_TOOL if plan else SUBMIT_TOOL)
+    refs = tool["input_schema"]["properties"]["cited_source_refs"]
+    allowed = list(summary.source_refs) if summary is not None else []
+    refs["maxItems"] = len(allowed)
+    if allowed:
+        refs["items"]["enum"] = allowed
+        instruction = f"For cited_source_refs, choose unique source IDs only from {json.dumps(allowed)}."
+        if summary.facts:
+            refs["minItems"] = 1
+            instruction += " Include at least one source_ref attached to a fact in the summary."
+    else:
+        instruction = "Return an empty array [] for cited_source_refs. No source IDs are available."
+    refs["description"] = instruction
+    return tool
+
+
 class LLMBackend(Protocol):
     def create(
         self, *, system: str, messages: list[dict], tools: list[dict],
@@ -204,12 +223,16 @@ class Analyst:
         features: MarketFeatures,
         held_symbols: list[str],
         untrusted_summary: UntrustedSummary | None,
+        tool: dict,
     ) -> str:
         # Exclude the raw bar list to keep the prompt small; the indicators are what
         # the analyst reasons over.
         payload = features.model_dump(mode="json", exclude={"recent_bars"})
+        source_instruction = tool["input_schema"]["properties"]["cited_source_refs"]["description"]
         prompt = (
-            "Analyze these features and submit_analysis.\n"
+            f"Analyze these features using {tool['name']}.\n"
+            "List the playbook concepts supporting your thesis in cited_concepts.\n"
+            f"{source_instruction}\n"
             f"Currently held (for correlation): {held_symbols or 'none'}\n"
             f"FEATURES:\n{json.dumps(payload, indent=2, default=str)}"
         )
@@ -245,11 +268,12 @@ class Analyst:
         with task.observe():
             if untrusted_summary is not None:
                 validate_summary_for_privileged_use(untrusted_summary)
-            prompt = self._prompt(features, held_symbols or [], untrusted_summary)
+            tool = _submission_tool(plan=plan, summary=untrusted_summary)
+            prompt = self._prompt(features, held_symbols or [], untrusted_summary, tool)
             response = task.create(
                 system=PLAN_PREAMBLE if plan else SYSTEM_PREAMBLE,
                 messages=[{"role": "user", "content": prompt}],
-                tools=[SUBMIT_PLAN_TOOL if plan else SUBMIT_TOOL],
+                tools=[tool],
                 tool_choice="any",
                 request_id=request_id,
             )
