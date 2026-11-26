@@ -13,13 +13,17 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from enum import StrEnum
+from threading import Event
 from typing import Any
 
 from ..identity import canonical_request_id
 from .budget import (
+    RESEARCH_RETRY_CATEGORY,
     ProviderBudgetService,
     ProviderInputEstimator,
 )
+from .cancellation import ResearchCancelled
 from .payloads import (
     to_gemini_contents,
     to_openai,
@@ -54,6 +58,27 @@ class LLMResponse:
     stop_reason: str = "end_turn"
     usage: Usage | None = field(default_factory=Usage)
     model: str = ""
+
+
+class RejectionCode(StrEnum):
+    UNAVAILABLE = "unavailable"
+    AUTHENTICATION = "authentication"
+    INVALID_REQUEST = "invalid_request"
+    CONFIGURATION = "configuration"
+    QUOTA = "quota"
+    OTHER = "provider_rejected"
+
+
+class ProviderRequestRejected(RuntimeError):
+    """A provider returned a completed error response with no billable output."""
+
+    def __init__(self, code: RejectionCode | str = RejectionCode.OTHER):
+        self.code = code if isinstance(code, RejectionCode) else RejectionCode.OTHER
+        super().__init__(self.code.value)
+
+
+class ProviderRequestAmbiguous(RuntimeError):
+    """The response does not establish provider rejection or token usage."""
 
 
 class BudgetedLLMBackend:
@@ -113,7 +138,11 @@ class BudgetedLLMBackend:
         tools: list[dict],
         tool_choice: str | None = None,
         request_id: str,
+        research_retry: bool = False,
+        cancel_event: Event | None = None,
     ):
+        if research_retry and self.category != "analysis":
+            raise ValueError("research retries require an analysis backend")
         request_id = canonical_request_id(request_id)
         validate_llm_payload(
             system=system,
@@ -126,15 +155,22 @@ class BudgetedLLMBackend:
             messages=messages,
             tools=tools,
         )
+        if cancel_event is not None and cancel_event.is_set():
+            raise ResearchCancelled()
         reservation = self.budgets.reserve(
             provider=self.provider,
-            category=self.category,
+            category=RESEARCH_RETRY_CATEGORY if research_retry else self.category,
             request_id=request_id,
             input_tokens=input_reservation,
             output_tokens=self.max_output_tokens,
         )
         try:
-            self.budgets.mark_started(reservation.reservation_id)
+            if cancel_event is None:
+                self.budgets.mark_started(reservation.reservation_id)
+            else:
+                self.budgets.mark_started(reservation.reservation_id, cancel_event=cancel_event)
+        except ResearchCancelled:
+            raise
         except BaseException as start_error:
             self._reconcile_unknown_after_failure(
                 reservation.reservation_id,
@@ -149,6 +185,21 @@ class BudgetedLLMBackend:
                 tool_choice=tool_choice,
                 request_id=request_id,
             )
+        except ProviderRequestRejected:
+            try:
+                # Keep the attempted call charged, but the confirmed HTTP error
+                # has no generated token usage to leave unresolved.
+                self.budgets.settle(
+                    reservation.reservation_id,
+                    input_tokens=0,
+                    output_tokens=0,
+                )
+            except BaseException as settlement_error:
+                self._reconcile_unknown_after_failure(
+                    reservation.reservation_id, settlement_error
+                )
+                raise
+            raise
         except BaseException as delegate_error:
             self._reconcile_unknown_after_failure(
                 reservation.reservation_id,

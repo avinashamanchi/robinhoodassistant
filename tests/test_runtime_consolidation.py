@@ -150,6 +150,7 @@ def _consolidate(
     source_root: Path | None = None,
     destination_root: Path | None = None,
     roots: ConsolidationRoots | None = None,
+    replace_destination_sha256: str | None = None,
 ):
     return consolidate_runtime(
         source_root or fixture.source_root,
@@ -159,7 +160,23 @@ def _consolidate(
         process_identity=CONSOLIDATION_IDENTITY,
         process_inspector=OfflineProcessInspector(),
         roots=roots or fixture.roots,
+        replace_destination_sha256=replace_destination_sha256,
     )
+
+
+def _record_history(path: Path, request_id: str) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "INSERT INTO audit_events "
+            "(id, actor, action, target_type, target_id, request_id, created_at) "
+            "VALUES (1, 'autopilot', 'order.submitted', 'order', '1', ?, "
+            "'2026-08-11 14:00:10.000000')",
+            (request_id,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def _allow_cooperative_absence(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1003,6 +1020,93 @@ def test_postinstall_interruption_marks_uncertain_and_blocks_startup(
         }
     finally:
         engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("acknowledgment", "stable_code"),
+    [
+        (None, "destination_history_not_in_source"),
+        ("0" * 64, "destination_acknowledgment_mismatch"),
+        ("not-a-sha256", "destination_acknowledgment_invalid"),
+    ],
+    ids=["unacknowledged", "wrong-hash", "malformed-hash"],
+)
+def test_refuses_destination_history_missing_from_source(
+    runtime_fixture: RuntimeFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    acknowledgment: str | None,
+    stable_code: str,
+):
+    _allow_cooperative_absence(monkeypatch)
+    _record_history(runtime_fixture.destination_database, "destination-only")
+    source_before = _snapshot(runtime_fixture.source_database)
+    destination_before = _snapshot(runtime_fixture.destination_database)
+
+    with pytest.raises(ConsolidationError) as exc:
+        _consolidate(
+            runtime_fixture,
+            replace_destination_sha256=acknowledgment,
+        )
+
+    assert exc.value.stable_code == stable_code
+    _assert_unchanged(runtime_fixture.source_database, source_before)
+    _assert_unchanged(runtime_fixture.destination_database, destination_before)
+    assert not list_committed_backups(
+        runtime_fixture.destination_root / ".local" / "encrypted-backups",
+        artifact_label="whole-database-v1",
+    )
+
+
+def test_replaces_divergent_destination_only_for_its_exact_hash(
+    runtime_fixture: RuntimeFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _allow_cooperative_absence(monkeypatch)
+    _record_history(runtime_fixture.destination_database, "destination-only")
+    acknowledged = hashlib.sha256(
+        runtime_fixture.destination_database.read_bytes()
+    ).hexdigest()
+
+    receipt = _consolidate(
+        runtime_fixture,
+        replace_destination_sha256=acknowledged,
+    )
+
+    assert receipt.status == "verified"
+    assert receipt.destination_backup_hash is not None
+    assert _read_rows(runtime_fixture.destination_database) == (
+        (1, "source-row"),
+    )
+    connection = sqlite3.connect(
+        f"{runtime_fixture.destination_database.as_uri()}?mode=ro",
+        uri=True,
+    )
+    try:
+        assert connection.execute(
+            "SELECT count(*) FROM audit_events"
+        ).fetchone() == (0,)
+    finally:
+        connection.close()
+    assert list_committed_backups(
+        runtime_fixture.destination_root / ".local" / "encrypted-backups",
+        artifact_label="whole-database-v1",
+    )
+
+
+def test_destination_history_already_in_source_needs_no_acknowledgment(
+    runtime_fixture: RuntimeFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _allow_cooperative_absence(monkeypatch)
+    _record_history(runtime_fixture.source_database, "shared-history")
+    _record_history(runtime_fixture.destination_database, "shared-history")
+
+    receipt = _consolidate(runtime_fixture)
+
+    assert receipt.status == "verified"
+    assert _read_rows(runtime_fixture.destination_database) == (
+        (1, "source-row"),
+    )
 
 
 def test_missing_destination_is_installed_without_plaintext_archive(

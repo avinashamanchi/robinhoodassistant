@@ -6,6 +6,8 @@ import json
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from itertools import islice
+from time import monotonic
 
 from sqlalchemy import event, func, inspect as sa_inspect, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
@@ -60,6 +62,9 @@ from .safety_state import (
     UnsafeLocalState,
     enumerate_unsafe_local_state,
 )
+
+_FILL_CONVERGENCE_SECONDS = 10.0
+_MAX_REFRESH_ACTIVITIES = 99
 
 _LOCAL_LIVE_STATUSES = (
     OrderStatus.SUBMITTING.value,
@@ -375,6 +380,13 @@ def _commit_reconciliation_mutations(
 
 
 @dataclass(frozen=True)
+class _FillRefresh:
+    after: datetime
+    deadline: float
+    observed_orders: frozenset[int]
+
+
+@dataclass(frozen=True)
 class ReconciliationReport:
     resolved_unknown: int
     unresolved_unknown: tuple[int, ...]
@@ -557,6 +569,7 @@ class ReconciliationService:
                 reason=reason,
                 request_id=request_id,
             )
+            convergence_deadline = monotonic() + _FILL_CONVERGENCE_SECONDS
             (
                 inserted_fills,
                 invalid_fill_order_ids,
@@ -569,16 +582,17 @@ class ReconciliationService:
                     request_id=request_id,
                 )
             )
-            synced, synthetic_fills = self._reconcile_statuses(
+            synced, additional_fills = self._reconcile_statuses(
                 drift,
                 prefetched_results=resolved_results,
+                convergence_deadline=None if unresolved else convergence_deadline,
                 blocked_fill_order_ids=invalid_fill_order_ids,
                 exact_fill_stream_complete=exact_fill_stream_complete,
                 actor=actor,
                 reason=reason,
                 request_id=request_id,
             )
-            inserted_fills += synthetic_fills
+            inserted_fills += additional_fills
             self._detect_quarantined_fills(drift)
             self._clear_reconciled_rule_groups(
                 actor=actor,
@@ -901,6 +915,7 @@ class ReconciliationService:
         actor: str,
         reason: str,
         request_id: str,
+        refresh: _FillRefresh | None = None,
     ) -> tuple[int, frozenset[int], bool]:
         activity_reader = getattr(self.broker, "get_fill_activities", None)
         if not callable(activity_reader):
@@ -908,7 +923,19 @@ class ReconciliationService:
 
         _last_activity_id, after, expected_version = self._cursor_snapshot()
         try:
-            activities = list(activity_reader(after=after))
+            if refresh is None:
+                activities = list(activity_reader(after=after))
+            else:
+                if monotonic() >= refresh.deadline:
+                    raise TimeoutError
+                reader = getattr(self.broker, "refresh_fill_activities", activity_reader)
+                activities = list(
+                    islice(reader(after=refresh.after), _MAX_REFRESH_ACTIVITIES + 1)
+                )
+                if len(activities) > _MAX_REFRESH_ACTIVITIES:
+                    raise ValueError("incomplete fill activity refresh page")
+                if monotonic() >= refresh.deadline:
+                    raise TimeoutError
         except BrokerDataIntegrityError as exc:
             blocked_order_ids = self._latch_broker_order_id(
                 exc.broker_order_id,
@@ -1010,6 +1037,23 @@ class ReconciliationService:
                         blocked_order_ids.add(order.id)
                         advance_cursor = False
                         continue
+                    if (
+                        refresh is not None
+                        and (
+                            duplicate is None
+                            or not fill_has_trusted_identity(duplicate)
+                        )
+                    ):
+                        # The execution and its gate must survive as one commit.
+                        # Each observed order releases its own latch after comparison.
+                        if order.id in refresh.observed_orders:
+                            self._latch_order_in_session(order, order.last_error_code)
+                        else:
+                            self._latch_order_in_session(order, "unverified_fill_status")
+                            blocked_order_ids.add(order.id)
+                            drift.append(
+                                f"fresh fill for order {order.id} requires a broker status"
+                            )
                     if duplicate is not None:
                         if not fill_has_trusted_identity(duplicate):
                             self._replace_with_authoritative_activity(
@@ -1075,10 +1119,14 @@ class ReconciliationService:
                     ):
                         blocked_order_ids.add(order.id)
 
-                if advance_cursor:
+                # A repair query can start later than the account cursor. Only
+                # an ordinary scan covers that interval. Its newest execution
+                # may be a duplicate already persisted by the repair.
+                if advance_cursor and refresh is None:
                     cursor_candidate = None
-                    if after is None:
-                        cursor_candidate = batch[-1]
+                    latest = batch[-1]
+                    if after is None or _normalized_utc(latest.filled_at) > after:
+                        cursor_candidate = latest
                     else:
                         at_or_after_cursor = [
                             activity
@@ -1278,11 +1326,57 @@ class ReconciliationService:
         cursor.last_activity_at = activity.filled_at
         cursor.version += 1
 
+    def _prepare_fill_refresh(
+        self,
+        results: list[tuple[int, OrderResult]],
+        *,
+        actor: str,
+        reason: str,
+        request_id: str,
+    ) -> datetime | None:
+        """Latch positive, identity-checked gaps before the extra broker I/O."""
+        with self.session_factory() as session:
+            lagging: list[Order] = []
+            for order_id, remote in results:
+                if not valid_cumulative_filled_qty(remote.filled_qty):
+                    return None
+                if remote.filled_qty == 0:
+                    continue
+                order = session.get(Order, order_id)
+                if order is None or remote.broker_order_id != order.broker_order_id:
+                    return None
+                if order_result_identity_error(
+                    remote, order.idempotency_key, order.ticker
+                ) or exact_fill_exceeds_order_quantity(order.qty, remote.filled_qty):
+                    return None
+                relation = fill_quantity_relation(
+                    remote.filled_qty, self._trusted_exact_fill_qty(session, order)
+                )
+                if relation is None or relation is FillQuantityRelation.BEHIND:
+                    return None
+                if relation is FillQuantityRelation.AHEAD:
+                    lagging.append(order)
+            if not lagging:
+                return None
+
+            # A different execution may already have advanced the account cursor.
+            # Revisit the affected order lifetimes, including accepted clock skew.
+            start = min(
+                _normalized_utc(order.submission_started_at or order.created_at)
+                for order in lagging
+            ) - timedelta(seconds=DEFAULT_MAX_FUTURE_SKEW_SECONDS)
+            _bind_reconciliation_context(session, actor, reason, request_id)
+            for order in lagging:
+                self._latch_order_in_session(order, order.last_error_code)
+            _commit_reconciliation_mutations(session, actor, reason, request_id)
+            return start
+
     def _reconcile_statuses(
         self,
         drift: list[str],
         *,
         prefetched_results: tuple[tuple[int, OrderResult], ...] = (),
+        convergence_deadline: float | None = None,
         blocked_fill_order_ids: frozenset[int] = frozenset(),
         exact_fill_stream_complete: bool = False,
         actor: str,
@@ -1342,6 +1436,35 @@ class ReconciliationService:
 
         inserted = 0
         exact_reader = callable(getattr(self.broker, "get_fill_activities", None))
+        if (
+            exact_fill_stream_complete
+            and not drift
+            and convergence_deadline is not None
+            and monotonic() < convergence_deadline
+        ):
+            refresh_after = self._prepare_fill_refresh(
+                results, actor=actor, reason=reason, request_id=request_id,
+            )
+            if refresh_after is not None:
+                try:
+                    (
+                        inserted,
+                        blocked_fill_order_ids,
+                        exact_fill_stream_complete,
+                    ) = self._reconcile_fill_activities(
+                        drift,
+                        actor=actor,
+                        reason=reason,
+                        request_id=request_id,
+                        refresh=_FillRefresh(
+                            after=refresh_after,
+                            deadline=convergence_deadline,
+                            observed_orders=frozenset(order_id for order_id, _ in results),
+                        ),
+                    )
+                except RequiredDependencyUnavailable:
+                    exact_fill_stream_complete = False
+                    drift.append("authoritative fill activity refresh unavailable")
         for order_id, remote in results:
             with self.session_factory() as session:
                 _bind_reconciliation_context(

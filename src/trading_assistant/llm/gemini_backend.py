@@ -14,7 +14,10 @@ from ..security.outbound import (
     new_httpx_client,
     require_origin,
 )
-from .base import LLMResponse, TextBlock, ToolUseBlock, Usage
+from .base import (
+    LLMResponse, ProviderRequestAmbiguous, ProviderRequestRejected, RejectionCode,
+    TextBlock, ToolUseBlock, Usage,
+)
 from .payloads import (
     build_gemini_payload,
     sanitize_gemini_schema,
@@ -23,6 +26,17 @@ from .payloads import (
 
 _GEMINI_ORIGIN = "https://generativelanguage.googleapis.com"
 _GEMINI_POLICY = OutboundPolicy(_GEMINI_ORIGIN)
+
+
+_CONFIRMED_REJECTIONS = {
+    (503, "UNAVAILABLE"): RejectionCode.UNAVAILABLE,
+    (401, "UNAUTHENTICATED"): RejectionCode.AUTHENTICATION,
+    (403, "PERMISSION_DENIED"): RejectionCode.AUTHENTICATION,
+    (400, "INVALID_ARGUMENT"): RejectionCode.INVALID_REQUEST,
+    (400, "FAILED_PRECONDITION"): RejectionCode.CONFIGURATION,
+    (404, "NOT_FOUND"): RejectionCode.CONFIGURATION,
+    (429, "RESOURCE_EXHAUSTED"): RejectionCode.QUOTA,
+}
 
 
 def _sanitize_schema(schema: Any) -> Any:
@@ -52,6 +66,22 @@ def from_gemini(resp: Any) -> LLMResponse:
         try:
             input_tokens = getattr(meta, "prompt_token_count")
             output_tokens = getattr(meta, "candidates_token_count")
+            thinking_tokens = getattr(meta, "thoughts_token_count", None)
+            if thinking_tokens is None:
+                thinking_tokens = 0
+            total_tokens = getattr(meta, "total_token_count", None)
+            # With thinking-only output Gemini can omit the candidate count.
+            # Infer it only when the provider's total proves the full usage.
+            if (
+                output_tokens is None
+                and type(input_tokens) is int
+                and type(thinking_tokens) is int
+                and type(total_tokens) is int
+                and input_tokens >= 0
+                and thinking_tokens >= 0
+                and total_tokens >= input_tokens + thinking_tokens
+            ):
+                output_tokens = total_tokens - input_tokens - thinking_tokens
         except AttributeError:
             pass
         else:
@@ -60,10 +90,12 @@ def from_gemini(resp: Any) -> LLMResponse:
                 and input_tokens >= 0
                 and type(output_tokens) is int
                 and output_tokens >= 0
+                and type(thinking_tokens) is int
+                and thinking_tokens >= 0
             ):
                 usage = Usage(
                     input_tokens=input_tokens,
-                    output_tokens=output_tokens,
+                    output_tokens=output_tokens + thinking_tokens,
                 )
     return LLMResponse(
         content=blocks,
@@ -153,6 +185,9 @@ class GeminiBackend:
             system_instruction=payload["system_instruction"],
             max_output_tokens=self.max_tokens,
             tools=[types.Tool(function_declarations=decls)] if decls else None,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                disable=True
+            ),
         )
         # Preserve the validated explicit mode. "any" forces a function call
         # so a 200 always carries structured output.
@@ -166,9 +201,31 @@ class GeminiBackend:
                 )
             )
         config = types.GenerateContentConfig(**cfg_kwargs)
-        resp = self._get_client().models.generate_content(
-            model=self.model, contents=gem_contents, config=config
-        )
+        from google.genai.errors import APIError
+
+        try:
+            resp = self._get_client().models.generate_content(
+                model=self.model, contents=gem_contents, config=config
+            )
+        except APIError as error:
+            # Only trust the canonical Google error envelope on a matching HTTP
+            # response. A gateway page, timeout or local SDK error cannot prove
+            # the provider rejected this generation.
+            detail = error.details.get("error") if isinstance(error.details, dict) else None
+            status = error.code
+            if (
+                not isinstance(detail, dict)
+                or type(status) is not int
+                or getattr(error.response, "status_code", None) != status
+                or type(detail.get("code")) is not int
+                or detail["code"] != status
+                or not isinstance(detail.get("status"), str)
+            ):
+                raise ProviderRequestAmbiguous("provider_response_ambiguous") from None
+            code = _CONFIRMED_REJECTIONS.get((status, detail["status"]))
+            if code is None:
+                raise ProviderRequestAmbiguous("provider_response_ambiguous") from None
+            raise ProviderRequestRejected(code) from None
         return from_gemini(resp)
 
     @staticmethod

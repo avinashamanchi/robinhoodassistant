@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 from uuid import uuid4
 
+from ..ops.equity import EquitySnapshotRecorder
 from ..app.limits import LimitStoreUnavailable
 from ..config import load_config
 from ..notifications.base import build_notifier
@@ -91,7 +92,11 @@ def _finish_monitor(
         from decimal import Decimal
 
         from ..analyst.analyst import Analyst
-        from ..analyst.live_features import build_live_feature_provider, build_screen_source
+        from ..analyst.live_features import (
+            RefreshingScreenSource,
+            build_live_feature_provider,
+            build_screen_source,
+        )
         from ..analyst.planning import PlanningService
         from ..analyst.shadow import ShadowRunner
         from ..llm.factory import build_llm_backend
@@ -131,12 +136,14 @@ def _finish_monitor(
             secrets,
         )
         universe = config.screener.universe or config.risk.ticker_allowlist
-        screen_source = build_screen_source(
-            [s.upper() for s in universe],
-            secrets,
-            config=config,
-            runtime_role="daemon",
-            **historical_kwargs,
+        screen_source = RefreshingScreenSource(
+            lambda: build_screen_source(
+                [s.upper() for s in universe],
+                secrets,
+                config=config,
+                runtime_role="daemon",
+                **historical_kwargs,
+            )
         )
 
         def _price(sym: str):
@@ -165,6 +172,15 @@ def _finish_monitor(
 
         shadow = ShadowRunner(service, planning, screen_source, _price, top_n=3)
 
+    autopilot = _build_autopilot_runner(
+        config,
+        secrets,
+        container=container,
+        runtime_tenure_guard=runtime_tenure_guard,
+        historical_alpaca_client_factory=historical_alpaca_client_factory,
+        historical_cache_dir=historical_cache_dir,
+    )
+
     return Monitor(
         service,
         notifier,
@@ -185,6 +201,134 @@ def _finish_monitor(
             None,
         ),
         runtime_tenure_guard=runtime_tenure_guard,
+        autopilot=autopilot,
+        autopilot_timeout_seconds=config.autopilot.cycle_timeout_seconds,
+        equity_recorder=EquitySnapshotRecorder(service),
+        campaign_capture=_build_campaign_capture(config, service, runtime_tenure_guard, secrets=secrets),
+    )
+
+
+def _build_campaign_capture(config, service, guard, root=None, *, config_fingerprint=None, code_fingerprint=None, secrets=None):
+    from ..assets import AssetClass
+    from ..autopilot.evidence import EvidenceStore
+    from ..autopilot.identity import config_fingerprint as config_identity, decision_code_fingerprint, code_identity
+    from ..installation import source_root
+    from ..ops.acceptance_campaign import CampaignCapture, read_reconciliation, read_daemon_order_reconciliation, read_position_reconciliation, read_backup_artifacts
+    from ..ops.campaign_transitions import read_lifecycle, read_recovery, read_mock_drill
+    from ..ops.release_evidence import clean_commit
+    from ..ops.operational_state import StateStore
+    config_fingerprint = config_fingerprint or config_identity
+    code_fingerprint = code_fingerprint or decision_code_fingerprint
+    scope = {"mode": config.autopilot.mode, "config_fingerprint": config_fingerprint(config),
+             "code_fingerprint": code_fingerprint(config.autopilot.strategy)}
+    campaign_root = root or source_root()
+    runtime_code = code_identity(campaign_root)
+    if secrets is not None:
+        from ..security.crypto import build_sensitive_data_cipher
+        try:
+            cipher = build_sensitive_data_cipher(config.encryption, secrets)
+        except Exception:
+            # Campaign collection must not interrupt the trading safety loop or
+            # create unauthenticated operational evidence when keys are absent.
+            import logging
+            logging.getLogger(__name__).warning("campaign_cipher_unavailable")
+            return None
+    else:
+        cipher = None
+    def order_reconciliation(at):
+        if config.trading.broker.value != "alpaca":
+            return "unknown", "0" * 64
+        return read_daemon_order_reconciliation(service.session_factory, at, config.trading.reconciliation_max_age_seconds)
+
+    def startup_reconciliation(at):
+        if config.trading.broker.value != "alpaca":
+            return "unknown", "0" * 64
+        return read_reconciliation(service.session_factory, "alpaca", at, config.trading.reconciliation_max_age_seconds)
+
+    def position_reconciliation(at):
+        if config.trading.broker.value != "alpaca":
+            return "unknown", "0" * 64
+        return read_position_reconciliation(service.session_factory, at, config.trading.reconciliation_max_age_seconds)
+
+    def transitions(cycles, start, at):
+        real = config.trading.broker.value == "alpaca" and config.trading.mode.value == "paper"
+        lifecycle = read_lifecycle(service.session_factory, cycles, scope, start, at) if real else {"outcome": "unknown"}
+        recovery = read_recovery(service.session_factory, start, at) if real else {"outcome": "unknown"}
+        try:
+            mock = read_mock_drill(campaign_root, runtime_code, at) if runtime_code and clean_commit(campaign_root) == runtime_code else {"outcome": "unknown"}
+        except Exception:
+            mock = {"outcome": "unknown"}
+        return {"lifecycle": lifecycle, "recovery": recovery, "safety_drill": mock}
+
+    return CampaignCapture(StateStore(campaign_root), service.market_clock(AssetClass.EQUITY),
+                           EvidenceStore(service.session_factory, actor="campaign"), scope, guard,
+                           delay_minutes=getattr(config.autopilot, "run_after_open_minutes", 30),
+                           reconciliation_reader=startup_reconciliation,
+                           order_reconciliation_reader=order_reconciliation, position_reconciliation_reader=position_reconciliation,
+                           backup_reader=lambda at: read_backup_artifacts(campaign_root, at),
+                           runtime_code=runtime_code, transition_reader=transitions, cipher=cipher)
+
+
+def _build_autopilot_runner(
+    config,
+    secrets: RuntimeSecrets,
+    *,
+    container,
+    runtime_tenure_guard,
+    historical_alpaca_client_factory,
+    historical_cache_dir,
+):
+    """The daemon is the single owner of autopilot scheduling and orders."""
+    if config.autopilot.mode == "off":
+        return None
+    from datetime import timedelta
+
+    from ..analyst.live_features import build_live_feature_provider
+    from ..autopilot import Autopilot, AutopilotDisabled, autopilot_config_problems
+    from ..autopilot.decisions import exit_policy, require_paper, resolve_universe
+    from ..autopilot.evidence import EvidenceStore
+    from ..autopilot.runner import AutopilotRunner
+    from ..installation import source_root
+
+    require_paper(config)
+    problems = autopilot_config_problems(config)
+    if problems:
+        raise AutopilotDisabled(
+            "autopilot configuration cannot trade: " + "; ".join(problems)
+        )
+    service = container.service
+    autopilot = Autopilot(
+        service,
+        build_live_feature_provider(
+            config,
+            secrets,
+            scheduled_service=service,
+            rate_limiter=container.rate_limiter,
+            alpaca_client_factory=historical_alpaca_client_factory,
+            cache_dir=historical_cache_dir,
+            runtime_role="daemon",
+            require_market_clock=True,
+        ),
+        universe=resolve_universe(config),
+        notional_per_trade=config.autopilot.notional_per_trade,
+        max_orders_per_day=config.autopilot.max_orders_per_day,
+        strategy=config.autopilot.strategy,
+        dry_run=True,
+        max_feature_age=timedelta(hours=config.autopilot.max_feature_age_hours),
+        exit_policy=exit_policy(config),
+        retry_after_rejection_days=config.autopilot.retry_after_rejection_days,
+        tenure_guard=runtime_tenure_guard,
+    )
+    return AutopilotRunner(
+        config=config,
+        service=service,
+        autopilot=autopilot,
+        store=EvidenceStore(
+            container.session_factory,
+            actor=f"autopilot:{config.autopilot.strategy}",
+        ),
+        root=source_root(),
+        tenure_guard=runtime_tenure_guard,
     )
 
 

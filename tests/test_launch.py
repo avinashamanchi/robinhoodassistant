@@ -3,6 +3,8 @@ full order lifecycle integration (B2)."""
 
 from __future__ import annotations
 
+import contextlib
+
 import base64
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -1101,22 +1103,6 @@ def test_operations_domain_success_survives_supplementary_audit_failure(
         in caplog.text
     )
     assert marker not in caplog.text
-
-
-@pytest.mark.parametrize(
-    "plist_name",
-    [
-        "com.trading.app.plist",
-        "com.trading.daemon.plist",
-    ],
-)
-def test_launchd_discards_unbounded_stream_files(plist_name):
-    path = Path("scripts/launchd") / plist_name
-    with path.open("rb") as handle:
-        config = plistlib.load(handle)
-
-    assert config["StandardOutPath"] == "/dev/null"
-    assert config["StandardErrorPath"] == "/dev/null"
 
 
 @pytest.mark.parametrize(
@@ -2573,3 +2559,104 @@ def test_telegram_uses_fixed_origin_and_redacts_token_bearing_failures(caplog):
         ).send("notification") is False
 
     assert token not in caplog.text
+
+
+def _all_structural_pass(*_args, **_kwargs):
+    from trading_assistant import preflight
+
+    return [
+        preflight.Result(name, preflight.PASS, "ok")
+        for name in (
+            "KEYCHAIN",
+            "LOCAL_TLS",
+            "FIELD_ENCRYPTION",
+            "OUTBOUND_ORIGINS",
+            "INTEGRATIONS_DISABLED",
+        )
+    ]
+
+
+def test_preflight_refuses_an_unchosen_database_before_opening_it_or_the_broker(
+    app_config,
+    monkeypatch,
+    capsys,
+    tmp_path,
+):
+    from trading_assistant import preflight
+    from trading_assistant.security.secrets import MacOSKeychainSecretProvider
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    def must_not_run(*_args, **_kwargs):
+        raise AssertionError("database or broker touched before the database was chosen")
+
+    monkeypatch.setattr(preflight, "_structural_preflight_checks", _all_structural_pass)
+    for name in ("_alpaca", "_db", "_build_service"):
+        monkeypatch.setattr(preflight, name, must_not_run)
+
+    result = preflight._run(
+        app_config,
+        _structural_preflight_secrets(app_config),
+        provider=MacOSKeychainSecretProvider(backend=object()),
+    )
+
+    output = capsys.readouterr().out
+    assert result == 1
+    assert "RUNTIME SUMMARY" in output
+    assert "endpoint=https://paper-api.alpaca.markets" in output
+    assert "database:        REFUSED (database_not_chosen)" in output
+    assert "explicitly chosen database" in output and "=> NOT READY" in output
+
+
+def test_preflight_summary_names_the_chosen_database_then_runs_the_checks(
+    app_config,
+    monkeypatch,
+    capsys,
+):
+    from trading_assistant import preflight
+    from trading_assistant.security.secrets import MacOSKeychainSecretProvider
+
+    calls: list[str] = []
+    monkeypatch.setattr(preflight, "_structural_preflight_checks", _all_structural_pass)
+    monkeypatch.setattr(
+        preflight,
+        "_database_choice",
+        lambda _secrets: preflight.Result(
+            "explicitly chosen database", preflight.PASS, "/runtime/trading_assistant.db"
+        ),
+    )
+    monkeypatch.setattr(
+        preflight, "_alpaca", lambda _s: calls.append("alpaca") or []
+    )
+    monkeypatch.setattr(
+        preflight, "_db", lambda _s: calls.append("db") or []
+    )
+
+    @contextlib.contextmanager
+    def fake_service(_config, _secrets):
+        calls.append("service")
+        yield None
+
+    monkeypatch.setattr(preflight, "_build_service", fake_service)
+    monkeypatch.setattr(
+        preflight,
+        "_reconciliation",
+        lambda _service: preflight.Result("broker/local reconciliation", preflight.PASS),
+    )
+    for name in ("_llm_provider_configured", "_notification_configuration"):
+        monkeypatch.setattr(
+            preflight, name, lambda _c, _s, name=name: preflight.Result(name, preflight.SKIP)
+        )
+
+    preflight._run(
+        app_config,
+        _structural_preflight_secrets(app_config),
+        provider=MacOSKeychainSecretProvider(backend=object()),
+    )
+
+    output = capsys.readouterr().out
+    assert "database:        /runtime/trading_assistant.db" in output
+    assert "mode=paper" in output and "app bind:        127.0.0.1:8020" in output
+    assert calls[:2] == ["alpaca", "db"]

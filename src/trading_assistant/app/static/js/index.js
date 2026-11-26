@@ -395,6 +395,13 @@ async function refreshPending() {
       orderSummary(order),
       "ledger-entry-data",
     ));
+    if (typeof order.rationale === "string" && order.rationale) {
+      content.appendChild(node(
+        "div",
+        `Why: ${readable(order.rationale)}`,
+        "ledger-entry-data proposal-rationale",
+      ));
+    }
     content.appendChild(node(
       "div",
       `Expires ${readable(order.expires_at)}`,
@@ -1785,6 +1792,229 @@ async function submitChat(event) {
   }
 }
 
+function labelled(label, value) {
+  const row = node("div", null, "ledger-entry-data");
+  row.appendChild(node("strong", `${label}: `));
+  row.appendChild(document.createTextNode(readable(value)));
+  return row;
+}
+
+function describeLocation(value) {
+  if (value && typeof value === "object" && typeof value.error === "string") {
+    return `NOT SET (${value.error})`;
+  }
+  if (value && typeof value === "object" && typeof value.path === "string") {
+    return `${value.path} (chosen ${readable(value.chosen_at)})`;
+  }
+  return readable(value);
+}
+
+function describeSession(entry) {
+  const acted = (entry.decisions || []).filter((d) => d.action && d.action !== "none");
+  const skipped = (entry.decisions || []).filter((d) => !d.action || d.action === "none");
+  const parts = [`${readable(entry.result)} (${readable(entry.execution)})`];
+  if (acted.length) {
+    parts.push(acted.map((d) => `${d.action} ${d.symbol}: ${readable(d.reason)}`).join(", "));
+  }
+  const reasons = {};
+  for (const d of skipped) {
+    reasons[d.reason] = (reasons[d.reason] || 0) + 1;
+  }
+  const summary = Object.entries(reasons).map(([reason, count]) => `${readable(reason)} ×${count}`).join(", ");
+  if (summary) {
+    parts.push(`no action: ${summary}`);
+  }
+  return parts.join(" · ");
+}
+
+async function refreshAutopilot() {
+  const target = byId("autopilot-overview");
+  if (!target) {
+    return;
+  }
+  let overview;
+  try {
+    overview = await api("/autopilot");
+  } catch (error) {
+    clear(target);
+    target.appendChild(node("p", "Autopilot details are unavailable.", "empty-state"));
+    throw error;
+  }
+  clear(target);
+  const readiness = overview.readiness || {};
+  let readinessText;
+  if (readiness.error) {
+    readinessText = readiness.error;
+  } else if (readiness.ready) {
+    readinessText = `READY · ${readable(readiness.observed_sessions)} observed sessions`;
+  } else {
+    readinessText = "NOT READY · " + (readiness.unmet || []).map((r) => `${r.name}: ${r.detail}`).join("; ");
+  }
+  target.append(
+    labelled("Mode", `${readable(overview.mode)} · ${readable(overview.strategy)} · $${readable(overview.notional_per_trade)} per entry · at most ${readable(overview.max_orders_per_day)} orders per session`),
+    labelled("Universe", listText(overview.universe)),
+    labelled("Exits", `${readable(overview.exit_policy)} · a refused order is not retried for ${readable(overview.retry_after_rejection_days)} days`),
+    labelled("Readiness", readinessText),
+  );
+  const sessions = overview.sessions || [];
+  if (!sessions.length) {
+    target.appendChild(node("p", "No autopilot session recorded yet. The daemon runs one cycle per market session.", "empty-state"));
+    return;
+  }
+  for (const entry of sessions) {
+    target.appendChild(labelled(`Session ${readable(entry.session)}`, describeSession(entry)));
+  }
+}
+
+async function refreshRuntime() {
+  const target = byId("runtime-overview");
+  if (!target) {
+    return;
+  }
+  let runtime;
+  try {
+    runtime = await api("/runtime");
+  } catch (error) {
+    clear(target);
+    target.appendChild(node("p", "Runtime details are unavailable.", "empty-state"));
+    throw error;
+  }
+  clear(target);
+  const limits = runtime.risk_limits || {};
+  const tests = runtime.operator_test || {};
+  const autopilot = runtime.autopilot || {};
+  target.append(
+    labelled("Mode", `${String(runtime.trading_mode).toUpperCase()} · live trading ${readable(runtime.live_trading)}`),
+    labelled("Broker endpoint", runtime.broker_endpoint),
+    labelled("Checkout", describeLocation(runtime.checkout)),
+    labelled("Database", describeLocation(runtime.database)),
+    labelled("Autopilot", `${readable(autopilot.mode)} · ${readable(autopilot.strategy)} · $${readable(autopilot.notional_per_trade)} per entry`),
+    labelled("Auto-execution", runtime.auto_execute_preapproved_rules ? "ON" : "off"),
+    labelled(
+      "Risk limits",
+      `per order $${readable(limits.max_notional_per_order)} · per ticker $${readable(limits.max_position_per_ticker)}`
+        + ` · exposure $${readable(limits.max_portfolio_exposure)} · open positions ${readable(limits.max_open_positions, "unlimited")}`
+        + ` · orders per session ${readable(limits.max_orders_per_day, "unlimited")}`
+        + ` · daily loss $${readable(limits.daily_realized_loss_limit)} · proposals expire after ${readable(limits.proposal_ttl_minutes)} min`,
+    ),
+    labelled("Allowlist", listText(limits.ticker_allowlist)),
+    labelled(
+      "Operator test proposals",
+      tests.enabled
+        ? `enabled · symbols ${listText(tests.symbols)} · max $${readable(tests.max_notional_per_order)} per entry`
+        : "disabled (set operator_test.enabled in config.yaml)",
+    ),
+  );
+}
+
+async function cancelWorkingOrder(orderId, button) {
+  const reason = window.prompt(`Reason for cancelling order ${orderId}?`);
+  if (!reason || !reason.trim()) {
+    return;
+  }
+  button.disabled = true;
+  try {
+    const result = await api(`/orders/${orderId}/cancel`, jsonPost({reason: reason.trim()}));
+    notify(`Cancel requested for order ${orderId}: ${readable(result.status)}`);
+  } catch (error) {
+    notify(errorText(error), "notice-error");
+  } finally {
+    button.disabled = false;
+    void refreshOrders();
+  }
+}
+
+async function refreshOrders() {
+  const target = byId("orders");
+  if (!target) {
+    return;
+  }
+  let payload;
+  try {
+    payload = await api("/orders");
+  } catch (error) {
+    clear(target);
+    target.appendChild(node("p", "Orders are unavailable.", "empty-state"));
+    throw error;
+  }
+  clear(target);
+  const orders = Array.isArray(payload.orders) ? payload.orders : [];
+  if (!orders.length) {
+    target.appendChild(node("p", "No orders yet.", "empty-state"));
+    return;
+  }
+  const list = node("ul", null, "ledger");
+  orders.forEach((order) => {
+    const item = node("li", null, "ledger-entry");
+    const content = node("div");
+    const title = node("div", null, "ledger-entry-title");
+    title.appendChild(node("strong", `#${readable(order.order_id)} ${readable(order.ticker)}`));
+    title.appendChild(node("span", readable(order.status), "status-chip"));
+    if (order.source === "operator_test") {
+      title.appendChild(node("span", "OPERATOR TEST", "status-chip"));
+    }
+    content.appendChild(title);
+    content.appendChild(node("div", orderSummary(order), "ledger-entry-data"));
+    content.appendChild(node(
+      "div",
+      `Filled ${readable(order.filled_qty)} @ ${readable(order.avg_fill_price, "n/a")}`
+        + ` · source ${readable(order.source)} · broker id ${readable(order.broker_order_id, "none yet")}`,
+      "ledger-entry-data",
+    ));
+    content.appendChild(node(
+      "div",
+      `Approved ${readable(order.approved_at, "no")} · submitted ${readable(order.submitted_at, "no")}`
+        + (order.last_error_code ? ` · error ${order.last_error_code}` : ""),
+      "ledger-entry-data",
+    ));
+    item.appendChild(content);
+    if (order.cancellable === true) {
+      const actions = node("div", null, "ledger-actions");
+      const cancel = node("button", "Cancel at broker", "button-danger");
+      cancel.type = "button";
+      cancel.addEventListener("click", () => cancelWorkingOrder(order.order_id, cancel));
+      actions.appendChild(cancel);
+      item.appendChild(actions);
+    }
+    list.appendChild(item);
+  });
+  target.appendChild(list);
+}
+
+function optionalDecimal(elementId) {
+  const value = byId(elementId).value.trim();
+  return value ? value : null;
+}
+
+async function submitTestProposal(event) {
+  event.preventDefault();
+  const status = byId("test-proposal-status");
+  const button = byId("test-proposal-submit");
+  const body = {
+    scenario: byId("test-scenario").value,
+    symbol: byId("test-symbol").value.trim().toUpperCase(),
+    order_type: byId("test-order-type").value,
+    qty: optionalDecimal("test-qty"),
+    notional: optionalDecimal("test-notional"),
+    limit_price: optionalDecimal("test-limit"),
+    reason: byId("test-reason").value.trim(),
+  };
+  button.disabled = true;
+  status.textContent = "Creating test proposal…";
+  try {
+    const result = await api("/proposals/test", jsonPost(body));
+    status.textContent = result.status === "proposed"
+      ? `Test proposal #${result.order_id} created (estimated $${result.estimated_notional}). Review it under Pending decisions.`
+      : `Test proposal #${result.order_id} was ${result.status} by the risk check: ${listText(result.risk_reasons)}`;
+  } catch (error) {
+    status.textContent = `Not created: ${errorText(error)}`;
+  } finally {
+    button.disabled = false;
+    void refreshPending();
+    void refreshOrders();
+  }
+}
+
 async function refreshAll() {
   const jobs = [
     refreshHealth(),
@@ -1793,6 +2023,9 @@ async function refreshAll() {
     refreshPending(),
     refreshHoldings(),
     refreshRiskLog(),
+    refreshRuntime(),
+    refreshAutopilot(),
+    refreshOrders(),
   ];
   const results = await Promise.allSettled(jobs);
   const failed = results.find((result) => result.status === "rejected");
@@ -1859,6 +2092,7 @@ async function initialize() {
     }
   });
   byId("refresh-console").addEventListener("click", refreshAll);
+  byId("test-proposal-form").addEventListener("submit", submitTestProposal);
   byId("approval-form").addEventListener("submit", submitApproval);
   byId("approval-reason").addEventListener("input", updateApprovalButton);
   byId("approval-cancel").addEventListener(

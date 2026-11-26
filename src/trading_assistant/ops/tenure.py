@@ -532,6 +532,18 @@ class TenureGuardedBroker:
             raise AttributeError("get_fill_activities")
         return reader(after=after)
 
+    def refresh_fill_activities(self, *, after):
+        reader = getattr(self.__broker, "refresh_fill_activities", None)
+        if callable(reader):
+            return reader(after=after)
+        return self.get_fill_activities(after=after)
+
+    def get_economic_activities(self, start, end):
+        reader = getattr(self.__broker, "get_economic_activities", None)
+        if not callable(reader):
+            raise AttributeError("get_economic_activities")
+        return reader(start, end)
+
     def submit_order(self, order):
         self.__guard.ensure_owned()
         return self.__broker.submit_order(order)

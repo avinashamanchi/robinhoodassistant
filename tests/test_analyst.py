@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
-from pydantic import ValidationError
 
 from trading_assistant.analyst.analyst import Analyst
 from trading_assistant.analyst.models import AnalystAction
@@ -91,7 +90,7 @@ def test_analyst_passes_explicit_request_id_to_analysis_attempt():
 
 def test_missing_cited_concepts_rejected():
     bad = dict(_VALID, cited_concepts=[])
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValueError, match="report remained invalid"):
         Analyst(_backend(bad), max_attempts=2).analyze(
             _feat(),
             request_id="analyst-missing-citations",

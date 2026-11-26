@@ -250,8 +250,9 @@ def clean_repository(
     root = tmp_path / "repository"
     versions = root / "migrations" / "versions"
     versions.mkdir(parents=True)
-    (versions / "20260729_0017_release.py").write_text(
-        'revision = "20260729_0017"\n'
+    head = verifier_module.EXPECTED_MIGRATION_HEAD
+    (versions / f"{head}_release.py").write_text(
+        f'revision = "{head}"\n'
         "down_revision = None\n",
         encoding="utf-8",
     )
@@ -386,6 +387,10 @@ def test_repository_preflight_requires_the_pinned_anchor_to_be_an_ancestor(
 
 def test_release_verifier_has_only_the_exact_offline_commands():
     commands = ReleaseVerifier.default_commands()
+    coverage = next(
+        command for command in commands if command.name == "branch-coverage"
+    )
+    assert coverage.timeout_seconds == 2700.0
 
     assert verifier_module.CI_VERIFIER_BIN == Path(
         "/opt/trading-assistant-verifier/bin"
@@ -435,6 +440,22 @@ def test_release_verifier_has_only_the_exact_offline_commands():
                 "tests/test_untrusted_content.py",
                 "tests/test_candidate_boundary.py",
                 "tests/test_security_posture.py",
+                "tests/test_release_evidence.py",
+                "tests/test_release_actions_client.py",
+                "tests/test_release_operator_boundary.py",
+                "tests/test_operational_state.py",
+                "tests/test_power_guard.py",
+                "tests/test_runtime_operations.py",
+                "tests/test_runtime_alerts.py",
+                "tests/test_launchd_installer.py",
+                "tests/test_forward_evaluation.py",
+                "tests/test_acceptance_campaign.py",
+                "tests/test_campaign_transitions.py",
+                "tests/test_llm_budget.py",
+                "tests/test_llm_budget_review.py",
+                "tests/test_llm_budget_overrun_reconciliation.py",
+                "tests/test_research_reliability.py",
+                "tests/test_untrusted_model_quarantine.py",
                 "-v",
             ),
         ),
@@ -452,6 +473,7 @@ def test_release_verifier_has_only_the_exact_offline_commands():
                 "tests/test_breakers.py",
                 "tests/test_submission_barrier.py",
                 "tests/test_order_submission.py",
+                "tests/test_fill_read_convergence.py",
                 "tests/stress/test_stress_scenarios.py",
                 "-v",
             ),
@@ -1944,3 +1966,13 @@ def test_failed_command_still_rechecks_candidate_tree_before_reporting_failure(
 
     assert result.passed is False
     assert result.detail_code == "DIRTY_TREE"
+
+
+def test_expected_migration_head_tracks_the_repository_head():
+    """A new migration without a verifier re-pin turned CI red for weeks."""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    script = ScriptDirectory.from_config(Config("alembic.ini"))
+
+    assert verifier_module.EXPECTED_MIGRATION_HEAD == script.get_current_head()

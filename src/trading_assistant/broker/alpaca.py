@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
+from copy import copy
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -380,6 +381,7 @@ class AlpacaBroker(BrokerClient):
             buying_power=_d(acct.buying_power) or Decimal(0),
             equity=_d(acct.equity) or Decimal(0),
             cash=_d(acct.cash) or Decimal(0),
+            currency=getattr(acct, "currency", None),
         )
 
     def get_positions(self) -> list[Position]:
@@ -440,6 +442,15 @@ class AlpacaBroker(BrokerClient):
         self, after: datetime | None = None
     ) -> list[BrokerFill]:
         """Return exact Alpaca FILL activities, including IDs and exchange times."""
+        return self._read_fill_activities(after, single_page=False)
+
+    def refresh_fill_activities(self, *, after: datetime) -> list[BrokerFill]:
+        """One SDK GET for convergence. A full page cannot establish completeness."""
+        return self._read_fill_activities(after, single_page=True)
+
+    def _read_fill_activities(
+        self, after: datetime | None, *, single_page: bool,
+    ) -> list[BrokerFill]:
         params: dict[str, Any] = {
             "direction": "asc",
             "page_size": 100,
@@ -453,13 +464,22 @@ class AlpacaBroker(BrokerClient):
             normalized -= timedelta(seconds=1)
             params["after"] = normalized.isoformat().replace("+00:00", "Z")
 
+        trading = self._trading
+        if single_page and isinstance(trading, TradingClient):
+            # alpaca-py has no per-GET retry override. A shallow copy keeps
+            # the pinned session and leaves concurrent SDK callers untouched.
+            trading = copy(trading)
+            trading._retry = 0
         fills: list[BrokerFill] = []
         while True:
             page = _retry(
-                self._trading.get,
+                trading.get,
                 "/account/activities/FILL",
                 params,
+                attempts=1 if single_page else 3,
             )
+            if single_page and (not isinstance(page, list) or len(page) >= 100):
+                raise ValueError("incomplete fill activity refresh page")
             for raw in page:
                 raw_order_id = raw.get("order_id")
                 broker_order_id = (
@@ -537,6 +557,49 @@ class AlpacaBroker(BrokerClient):
                 break
             params["page_token"] = page[-1]["id"]
         return fills
+
+    def get_economic_activities(self, start: datetime, end: datetime) -> dict:
+        """Bounded Trading API read; ambiguous or undated economics fail closed."""
+        if start.tzinfo is None or end.tzinfo is None or end <= start:
+            raise ValueError("invalid activity interval")
+        params = {"direction": "asc", "page_size": 100,
+                  "after": (start - timedelta(seconds=1)).isoformat(),
+                  "until": (end + timedelta(seconds=1)).isoformat()}
+        seen, activities = set(), []
+        for _ in range(10):
+            page = _retry(self._trading.get, "/account/activities", params)
+            if not isinstance(page, list) or len(page) > 100:
+                raise ValueError("invalid activity page")
+            for raw in page:
+                if not isinstance(raw, dict):
+                    raise ValueError("invalid activity")
+                ident, kind = raw.get("id"), raw.get("activity_type")
+                if not isinstance(ident, str) or not ident or len(ident) > 200 or ident in seen:
+                    raise ValueError("invalid activity identity")
+                seen.add(ident)
+                if kind == "FILL":
+                    continue
+                # The documented non-trade date may be settlement date only.
+                # A date alone cannot establish the interval or Dietz weight.
+                raw_at = raw.get("transaction_time")
+                if not isinstance(raw_at, str):
+                    return {"coverage": "incomplete", "activities": []}
+                at = datetime.fromisoformat(raw_at.replace("Z", "+00:00"))
+                if at.tzinfo is None:
+                    return {"coverage": "incomplete", "activities": []}
+                amount = Decimal(str(raw.get("net_amount")))
+                if not amount.is_finite():
+                    raise ValueError("invalid activity amount")
+                if kind not in {"CSD", "CSW", "DIV", "INT", "CGD", "FEE", "CFEE", "DIVFEE"}:
+                    return {"coverage": "incomplete", "activities": []}
+                if start < at <= end:
+                    category = kind if kind in {"CSD", "CSW"} else ("fee" if kind in {"FEE", "CFEE", "DIVFEE"} else "income")
+                    activities.append({"id": ident, "type": category, "at": at.isoformat(), "amount": str(amount)})
+            if len(page) < 100:
+                # Activities may post after this request; absence is not final coverage.
+                return {"coverage": "provisional", "activities": activities}
+            params["page_token"] = page[-1]["id"]
+        raise ValueError("activity pagination limit exceeded")
 
     # ── orders (idempotent) ────────────────────────────────────
     def submit_order(self, order: OrderRequest) -> OrderResult:
@@ -868,6 +931,17 @@ class AlpacaClock:
 
     def next_close(self, at=None):
         return _retry(self._trading.get_clock).next_close
+
+    def session_range(self, start: date, end: date):
+        if type(start) is not date or type(end) is not date or start > end or (end - start).days > 31:
+            raise ValueError("invalid calendar range")
+        raw = _retry(self._trading.get_calendar, GetCalendarRequest(start=start, end=end), attempts=1)
+        rows = self._validated_sessions(raw, exchange_timezone=ZoneInfo("America/New_York"), start_date=start, end_date=end)
+        if not rows and (end - start).days >= 7:
+            raise BrokerDataIntegrityError("empty Alpaca market calendar")
+        return {"start": start.isoformat(), "end": end.isoformat(), "source": "alpaca_calendar", "sessions": [
+            {"date": day.isoformat(), "open": opened.isoformat(), "close": closed.isoformat()}
+            for day, opened, closed in sorted(rows)]}
 
     def observe(self, at: datetime) -> MarketClockObservation:
         observed_at = self._observation_time(at)

@@ -22,6 +22,7 @@ from ..security.sensitive_fields import persist_sensitive, sensitive_store
 from ..strategies.breakout import Breakout
 from ..strategies.rsi_reversion import RsiReversion
 from ..strategies.sma_crossover import SmaCrossover
+from ..strategies.sma_trend import SmaTrend
 from .data import DataSource
 from .evaluate import BacktestArtifactContext, persist_report, walk_forward
 from .report import EvaluationReport
@@ -35,7 +36,7 @@ _PROFILES = {
     "SPY": (0.0004, 0.010),
 }
 DEFAULT_SYMBOLS = ["TREND", "CHOP", "BEARY"]
-STRATEGIES = [SmaCrossover, RsiReversion, Breakout]
+STRATEGIES = [SmaCrossover, SmaTrend, RsiReversion, Breakout]
 MAX_CALENDAR_DAYS = 3_000
 
 

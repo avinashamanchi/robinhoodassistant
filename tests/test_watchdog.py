@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import os
 import subprocess
 from datetime import timedelta
 from decimal import Decimal
@@ -22,6 +23,7 @@ from trading_assistant.db.session import (
 from trading_assistant.ops import watchdog
 from trading_assistant.ops.watchdog import (
     labels_to_restart,
+    launch_agent_loaded,
     needs_restart,
     read_database_health,
 )
@@ -60,6 +62,64 @@ def _inject_watchdog_runtime_secrets(monkeypatch):
         "build_local_liveness_transport",
         lambda _certificate_path: _BodyLivenessTransport(_LIVE_BODY),
     )
+    monkeypatch.setattr(watchdog, "launch_agent_loaded", lambda _label: True)
+
+
+def test_main_skips_a_daemon_that_is_not_a_launchd_job(monkeypatch):
+    restarted: list[str] = []
+    monkeypatch.setattr(
+        watchdog,
+        "read_database_health",
+        lambda **_kwargs: {"db_ok": True, "heartbeat_age_seconds": 10_000},
+    )
+    monkeypatch.setattr(
+        watchdog,
+        "launch_agent_loaded",
+        lambda label: label != "com.trading.daemon",
+    )
+    monkeypatch.setattr(watchdog, "restart_launch_agent", restarted.append)
+
+    assert watchdog.main([]) == 0
+    assert restarted == []
+
+
+def test_main_still_restarts_a_loaded_app_when_the_daemon_is_not_a_job(
+    monkeypatch,
+):
+    restarted: list[str] = []
+    monkeypatch.setattr(
+        watchdog,
+        "build_local_liveness_transport",
+        lambda _certificate_path: _BodyLivenessTransport(b"{}"),
+    )
+    monkeypatch.setattr(
+        watchdog,
+        "read_database_health",
+        lambda **_kwargs: {"db_ok": True, "heartbeat_age_seconds": 10_000},
+    )
+    monkeypatch.setattr(
+        watchdog,
+        "launch_agent_loaded",
+        lambda label: label != "com.trading.daemon",
+    )
+    monkeypatch.setattr(watchdog, "restart_launch_agent", restarted.append)
+
+    assert watchdog.main([]) == 1
+    assert restarted == ["com.trading.app"]
+
+
+def test_launch_agent_loaded_reads_launchctl_print_only(monkeypatch):
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        assert kwargs["check"] is False
+        return subprocess.CompletedProcess(argv, 113)
+
+    monkeypatch.setattr(watchdog.subprocess, "run", fake_run)
+
+    assert launch_agent_loaded("com.trading.daemon") is False
+    assert calls == [["launchctl", "print", f"gui/{os.getuid()}/com.trading.daemon"]]
 
 
 def test_watchdog_restarts_only_when_health_is_stale_or_broken():
@@ -235,6 +295,45 @@ def test_api_outage_restarts_app_and_uses_db_heartbeat_for_daemon():
         database_health={"db_ok": True, "heartbeat_age_seconds": 999},
         stale_seconds=180,
     ) == {"com.trading.app", "com.trading.daemon"}
+
+
+def test_watchdog_gives_a_proven_starting_runtime_time_to_publish_health(monkeypatch, tmp_path):
+    from trading_assistant.bootstrap import acquire_runtime_guard, prepare_database_runtime
+    from trading_assistant.ops.tenure import ProcessIdentity, ProcessProof
+
+    database_url = f"sqlite:///{tmp_path}/startup.db"
+    upgrade(create_db_engine(database_url))
+    runtime = prepare_database_runtime(RuntimeSecrets(database_url=database_url))
+
+    class Inspector:
+        def inspect(self, identity):
+            return ProcessProof.SAME
+
+    monkeypatch.setattr(watchdog, "LocalProcessInspector", Inspector)
+    guard = acquire_runtime_guard(
+        runtime, "daemon", process_identity=ProcessIdentity(9001, "starting-daemon"),
+        process_inspector=Inspector(),
+    )
+    try:
+        health = read_database_health(f"sqlite:///{tmp_path}/startup.db")
+        assert labels_to_restart(
+            api_health=_LIVE, database_health=health, stale_seconds=180
+        ) == set()
+        with runtime.session_factory() as session:
+            from trading_assistant.db.models import RuntimeTenure
+            row = session.get(RuntimeTenure, "runtime:daemon")
+            session.execute(
+                update(RuntimeTenure)
+                .where(RuntimeTenure.resource_key == row.resource_key)
+                .values(acquired_at=utcnow() - timedelta(seconds=60))
+            )
+            session.commit()
+        health = read_database_health(f"sqlite:///{tmp_path}/startup.db")
+        assert labels_to_restart(
+            api_health=_LIVE, database_health=health, stale_seconds=180
+        ) == {"com.trading.daemon"}
+    finally:
+        guard.close()
 
 
 def test_database_unavailable_restarts_daemon_only_when_api_is_live():

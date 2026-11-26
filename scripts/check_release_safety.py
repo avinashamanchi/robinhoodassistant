@@ -3288,45 +3288,34 @@ def _check_verified_runtime_consolidation_transfer(root: Path) -> None:
         if isinstance(node, ast.Constant)
         and isinstance(node.value, str)
     }
-    production_destination = (
-        "/Users/avi/Desktop/robinhood/trading-assistant"
-    )
-    production_source = (
-        production_destination
-        + "/.worktrees/safety-foundation"
-    )
-    if production_destination not in constants:
-        _fail("runtime consolidation destination root is not exact")
-    source_assignment = next(
+    # Production roots must be the operator's designated installation and
+    # its exact worktree, derived at run time, never a hard-coded checkout.
+    if any(
+        value.startswith("/" + "Users/") or value.startswith("/" + "home/")
+        for value in constants
+    ):
+        _fail("runtime consolidation hard-codes a checkout path")
+    production_roots = next(
         (
             node
             for node in getattr(tree, "body", ())
-            if isinstance(node, (ast.Assign, ast.AnnAssign))
-            and any(
-                isinstance(target, ast.Name)
-                and target.id in {
-                    "_PRODUCTION_SOURCE",
-                    "PRODUCTION_SOURCE",
-                }
-                for target in (
-                    node.targets
-                    if isinstance(node, ast.Assign)
-                    else [node.target]
-                )
-            )
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_production_roots"
         ),
         None,
     )
-    source_composed = bool(
-        source_assignment is not None
-        and "_PRODUCTION_DESTINATION"
-        in _runtime_transfer_tokens(source_assignment.value)
-        and ".worktrees"
-        in _runtime_transfer_tokens(source_assignment.value)
-        and "safety-foundation"
-        in _runtime_transfer_tokens(source_assignment.value)
-    )
-    if production_source not in constants and not source_composed:
+    if production_roots is None or not any(
+        isinstance(node, ast.Call)
+        and _attribute_path(node.func)[-1:] == ("require_designated",)
+        for node in ast.walk(production_roots)
+    ):
+        _fail("runtime consolidation destination root is not exact")
+    source_tokens = _runtime_transfer_tokens(production_roots)
+    if (
+        ".worktrees" not in source_tokens
+        or "safety-foundation" not in source_tokens
+        or "destination" not in source_tokens
+    ):
         _fail("runtime consolidation source root is not exact")
 
     worktree_comparison = any(
@@ -3339,7 +3328,10 @@ def _check_verified_runtime_consolidation_transfer(root: Path) -> None:
         and ".worktrees" in _runtime_transfer_tokens(node)
         for node in ast.walk(tree)
     )
-    if not source_composed and not worktree_comparison:
+    # Both are required: the production source is composed from the
+    # designated destination's worktree above, and the supplied source root
+    # is independently checked to be that worktree.
+    if not worktree_comparison:
         _fail("runtime consolidation worktree identity is unproven")
 
     strict_resolves = [
@@ -4404,6 +4396,34 @@ def _yaml_key_line(path: Path, key: str) -> int:
         if pattern.match(line):
             return number
     return 1
+
+
+def _scan_operator_release_imports(root: Path) -> list[ReleaseViolation]:
+    """An authenticated operator script must not enter the trading runtime."""
+    findings = []
+    for path in _python_sources(root):
+        relative = path.relative_to(root).as_posix()
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):
+            findings.append(_finding("OPERATOR_TOOL_RUNTIME_IMPORT", relative, 1))
+            continue
+        for node in ast.walk(tree):
+            modules = []
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                modules = [node.module or ""]
+            elif isinstance(node, ast.Call) and _attribute_path(node.func)[-1:] in (
+                ("import_module",), ("__import__",), ("run_module",), ("run_path",),
+                ("spec_from_file_location",), ("SourceFileLoader",),
+            ):
+                modules = [arg.value for arg in node.args if isinstance(arg, ast.Constant) and isinstance(arg.value, str)]
+            if any(value == "scripts" or value.startswith(("scripts.", "scripts/"))
+                   or any(name in value for name in ("sync_release_evidence", "runtime_alerts", "runtime_operations"))
+                   for value in modules):
+                findings.append(_finding("OPERATOR_TOOL_RUNTIME_IMPORT", relative, node.lineno))
+    return findings
 
 
 def _python_sources(root: Path) -> list[Path]:
@@ -8980,6 +9000,39 @@ _LEGACY_RELEASE_CHECKS = (
     ),
 )
 
+
+_CHECKOUT_PATH = re.compile(r"/" + r"(?:Users|home)/[^/\s\"']+/")
+
+
+def _scan_hardcoded_checkout_paths(root: Path) -> list[ReleaseViolation]:
+    """Runtime code and launchers must derive the installation root.
+
+    A literal per-user checkout path broke every entry point when the
+    checkout moved; the designated installation replaces it.
+    """
+    candidates: list[Path] = []
+    source_root = root / "src" / "trading_assistant"
+    if source_root.is_dir() and not source_root.is_symlink():
+        candidates.extend(sorted(source_root.rglob("*.py")))
+    for pattern in ("scripts/*.sh", "scripts/launchd/*.sh"):
+        candidates.extend(sorted(root.glob(pattern)))
+    findings: list[ReleaseViolation] = []
+    for path in candidates:
+        if path.is_symlink() or not path.is_file():
+            continue
+        relative = path.relative_to(root).as_posix()
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            findings.append(_finding("HARDCODED_CHECKOUT_PATH", relative, 1))
+            continue
+        for number, line in enumerate(lines, start=1):
+            if _CHECKOUT_PATH.search(line):
+                findings.append(
+                    _finding("HARDCODED_CHECKOUT_PATH", relative, number)
+                )
+    return findings
+
 _STRUCTURED_RELEASE_SCANNERS = (
     (
         _scan_canonical_authorities,
@@ -9012,6 +9065,11 @@ _STRUCTURED_RELEASE_SCANNERS = (
         "src/trading_assistant/security/outbound.py",
     ),
     (
+        _scan_operator_release_imports,
+        "OPERATOR_TOOL_RUNTIME_IMPORT",
+        "scripts/sync_release_evidence.py",
+    ),
+    (
         _scan_transport_and_integrations,
         "CONFIG_UNPROVEN",
         "config.yaml",
@@ -9020,6 +9078,11 @@ _STRUCTURED_RELEASE_SCANNERS = (
         _scan_tracked_artifacts,
         "GIT_TREE_UNPROVEN",
         ".",
+    ),
+    (
+        _scan_hardcoded_checkout_paths,
+        "HARDCODED_CHECKOUT_PATH",
+        "src/trading_assistant",
     ),
     (
         _scan_current_credential_fingerprints,
