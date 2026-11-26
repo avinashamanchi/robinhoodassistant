@@ -165,10 +165,10 @@ _MIGRATION_TEST_MANIFEST = TestManifest(
     ),
 )
 _SECURITY_TEST_MANIFEST = TestManifest(
-    count=1108,
+    count=1174,
     digest=(
-        "sha256:7e3afd4069923aee42c7339df23c63cd"
-        "aedbef238e19abc7f45784678f96d678"
+        "sha256:6aabd96a14f41d9f21d37f3e93d41804"
+        "85ba0c7f8e73262dcfd4d417f5dcb0d1"
     ),
 )
 _SAFETY_TEST_MANIFEST = TestManifest(
@@ -186,10 +186,10 @@ _FRONTEND_TEST_MANIFEST = TestManifest(
     ),
 )
 _FULL_TEST_MANIFEST = TestManifest(
-    count=5433,
+    count=5447,
     digest=(
-        "sha256:7fe3a6cc888d7d7c89dca943d4d55a6a"
-        "a6278846dc03aabde16bbec321dc95a4"
+        "sha256:affb2482fdff22d1b03b0bd5fdbbd06b"
+        "d6bf25682550156dd7ebef69a3188e1a"
     ),
 )
 
@@ -1777,6 +1777,7 @@ class ReleaseVerifier:
                     "tests/test_llm_budget_review.py",
                     "tests/test_llm_budget_overrun_reconciliation.py",
                     "tests/test_research_reliability.py",
+                    "tests/test_untrusted_model_quarantine.py",
                     "-v",
                 ),
                 timeout_seconds=1200.0,

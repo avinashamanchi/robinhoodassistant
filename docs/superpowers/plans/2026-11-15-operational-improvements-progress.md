@@ -172,7 +172,7 @@ does not establish current continuous uptime.
   campaign observations verified; AC power and both sleep assertions were observed.
   The private runtime receipt is `task4b-acceptance.json`. No new natural partial-fill
   crossing or complete future month is claimed; controlled restart remains pending.
-- Task 5: source implementation and independent review complete at `95949b0`,
+- Task 5: source implementation and independent review complete at `5beb3bf`,
   based on `b86f4de` in the isolated development checkout. Retries require a
   confirmed transient rejection and a fresh atomic reservation, with at most one
   additional attempt per task and two retry reservations per provider per UTC day,
@@ -185,10 +185,17 @@ does not establish current continuous uptime.
     run passed 778; review-fix verification passed 47. All three Important review
     findings were addressed with RED/GREEN regressions and scoped re-review.
     Release-boundary checks passed 69 and the static safety gate passed.
-  - Full/security collections are pinned to 5,433/1,108 tests. Current-commit CI,
-    deployment, conservative historical budget recovery and a bounded real-provider
-    check remain required. Private actual acceptance will be recorded separately
-    in `.local/improvements/task5-acceptance.json`.
+  - The initial release `fa34116` passed actual CI (5,432 passed, one credentialed
+    skip; 93.65% selected coverage), deployed, restored all eight jobs and reported
+    Paper READY. Historical unknown usage was conservatively charged and settled
+    without a refund or cap change. Two bounded Gemini calls returned HTTP 200
+    but invalid citations; both failures remain in the evidence.
+  - Round two constrains each request to its validated citation context, with
+    independent concurrent schemas. Fourteen new regressions and 355 affected
+    tests passed; scoped review is clean. Full/security collections are pinned
+    to 5,447/1,174 tests, including the model quarantine suite. New exact-commit
+    CI, deployment and one bounded real-provider validation remain required.
+    Actual acceptance stays false in `.local/improvements/task5-acceptance.json`.
   - The designated Paper runtime continues on its accepted release during CI.
     The historical holdout remains preserved. Synthetic integration fixtures do
     not establish actual provider billing or strategy performance.

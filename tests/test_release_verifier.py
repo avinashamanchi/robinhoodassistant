@@ -455,6 +455,7 @@ def test_release_verifier_has_only_the_exact_offline_commands():
                 "tests/test_llm_budget_review.py",
                 "tests/test_llm_budget_overrun_reconciliation.py",
                 "tests/test_research_reliability.py",
+                "tests/test_untrusted_model_quarantine.py",
                 "-v",
             ),
         ),
